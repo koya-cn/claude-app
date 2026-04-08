@@ -12,13 +12,18 @@ Claude CLI の過去のセッション履歴（`~/.claude/`）から、キーワ
 ## 🚀 インストール方法
 
 1. スクリプトの内容を `claude-resume.py` として保存します。
-2. パスの通ったディレクトリ（例: `/usr/local/bin`）へ、**拡張子を除いた名前**でコピーします。
+2. パスの通ったディレクトリ（例: `/usr/local/bin`）へインストールします。
+
+   **コピーする場合:**
    ```bash
    sudo cp claude-resume.py /usr/local/bin/claude-resume
-   ```
-3. コピーしたファイルに実行権限を付与します。
-   ```bash
    sudo chmod +x /usr/local/bin/claude-resume
+   ```
+
+   **シンボリックリンクを使う場合（スクリプト更新時に再コピー不要）:**
+   ```bash
+   sudo ln -s /path/to/claude-resume.py /usr/local/bin/claude-resume
+   chmod +x /path/to/claude-resume.py
    ```
 
 ## 💻 使い方
