@@ -12,17 +12,31 @@ CONFIG_FILE = Path.home() / ".claude-resume.json"
 JST = timezone(timedelta(hours=9))
 
 
-def load_target_dirs():
+def load_target_dirs(debug=False):
+    if debug:
+        print(f"[DEBUG] CONFIG_FILE: {CONFIG_FILE}")
+        print(f"[DEBUG] exists: {CONFIG_FILE.exists()}")
+
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
             dirs = config.get("dirs", [])
+            if debug:
+                print(f"[DEBUG] dirs in config: {dirs}")
             if dirs:
-                return [Path(d).expanduser() for d in dirs]
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return [Path.home() / ".claude"]
+                resolved = [Path(d).expanduser() for d in dirs]
+                if debug:
+                    for p in resolved:
+                        print(f"[DEBUG] resolved path: {p} (exists: {p.exists()})")
+                return resolved
+        except (json.JSONDecodeError, KeyError) as e:
+            if debug:
+                print(f"[DEBUG] config parse error: {e}")
+    default = [Path.home() / ".claude"]
+    if debug:
+        print(f"[DEBUG] using default: {default[0]} (exists: {default[0].exists()})")
+    return default
 
 
 def _format_timestamp(ts):
@@ -37,9 +51,9 @@ def _format_timestamp(ts):
 
 # ─── キーワード検索（既存機能） ───────────────────────────────────────────────
 
-def fuzzy_search_prompts(keyword, target_dirs=None):
+def fuzzy_search_prompts(keyword, target_dirs=None, debug=False):
     if target_dirs is None:
-        target_dirs = load_target_dirs()
+        target_dirs = load_target_dirs(debug=debug)
 
     print(f"🔍 検索キーワード: '{keyword}' (ユーザー＆AIの出力を検索)")
     print("=" * 60)
@@ -147,53 +161,110 @@ def fuzzy_search_prompts(keyword, target_dirs=None):
 
 # ─── 直近セッション一覧（新機能） ────────────────────────────────────────────
 
-def load_recent_sessions(count=5):
-    history_file = Path.home() / ".claude" / "history.jsonl"
+def load_recent_sessions(count=5, debug=False):
+    target_dirs = load_target_dirs(debug=debug)
 
-    if not history_file.exists():
-        print(f"履歴ファイルが見つかりません: {history_file}")
+    sessions = {}      # sessionId -> dict (history.jsonl 由来)
+    win_sessions = {}  # sessionId -> dict (sessions/*.json 由来)
+
+    for base_dir in target_dirs:
+        if not base_dir.exists() or not base_dir.is_dir():
+            if debug:
+                print(f"[DEBUG] skip (not found): {base_dir}")
+            continue
+
+        # ── A) history.jsonl ──────────────────────────────
+        history_file = base_dir / "history.jsonl"
+        if history_file.exists():
+            if debug:
+                print(f"[DEBUG] reading history.jsonl: {history_file}")
+            with open(history_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    sid = entry.get("sessionId")
+                    if not sid:
+                        continue
+
+                    display   = entry.get("display", "").strip()
+                    timestamp = entry.get("timestamp", 0)
+                    project   = entry.get("project", "")
+
+                    if sid not in sessions:
+                        sessions[sid] = {
+                            "session_id":   sid,
+                            "project":      project,
+                            "project_name": Path(project).name if project else "(不明)",
+                            "first_ts":     timestamp,
+                            "last_ts":      timestamp,
+                            "prompts":      [],
+                        }
+
+                    sess = sessions[sid]
+                    if timestamp < sess["first_ts"]:
+                        sess["first_ts"] = timestamp
+                    if timestamp > sess["last_ts"]:
+                        sess["last_ts"]      = timestamp
+                        sess["project"]      = project
+                        sess["project_name"] = Path(project).name if project else "(不明)"
+                    if display:
+                        sess["prompts"].append({"display": display, "timestamp": timestamp})
+
+        # ── B) sessions/*.json ────────────────────────────
+        sessions_dir = base_dir / "sessions"
+        if sessions_dir.exists() and sessions_dir.is_dir():
+            if debug:
+                print(f"[DEBUG] reading sessions/: {sessions_dir}")
+            for json_file in sessions_dir.glob("*.json"):
+                try:
+                    with open(json_file, 'r', encoding='utf-8') as f:
+                        entry = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+                sid = entry.get("sessionId")
+                if not sid:
+                    continue
+
+                timestamp = entry.get("startedAt", 0)
+                cwd       = entry.get("cwd", "")
+                try:
+                    project_name = Path(cwd).name if cwd else "(不明)"
+                except Exception:
+                    project_name = "(不明)"
+
+                if sid not in win_sessions:
+                    win_sessions[sid] = {
+                        "session_id":   sid,
+                        "project":      cwd,
+                        "project_name": project_name,
+                        "first_ts":     timestamp,
+                        "last_ts":      timestamp,
+                        "prompts":      [],
+                    }
+                else:
+                    w = win_sessions[sid]
+                    if timestamp < w["first_ts"]:
+                        w["first_ts"] = timestamp
+                    if timestamp > w["last_ts"]:
+                        w["last_ts"]      = timestamp
+                        w["project"]      = cwd
+                        w["project_name"] = project_name
+
+    # ── 重複排除: history.jsonl 側を優先 ─────────────────
+    for sid, entry in win_sessions.items():
+        if sid not in sessions:
+            sessions[sid] = entry
+
+    if not sessions:
+        print("セッション履歴が見つかりません。")
         return []
-
-    sessions = {}  # sessionId -> dict
-
-    with open(history_file, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-
-            sid = entry.get("sessionId")
-            if not sid:
-                continue
-
-            display = entry.get("display", "").strip()
-            timestamp = entry.get("timestamp", 0)
-            project = entry.get("project", "")
-
-            if sid not in sessions:
-                sessions[sid] = {
-                    "session_id": sid,
-                    "project": project,
-                    "project_name": Path(project).name if project else "(不明)",
-                    "first_ts": timestamp,
-                    "last_ts": timestamp,
-                    "prompts": [],
-                }
-
-            sess = sessions[sid]
-            if timestamp < sess["first_ts"]:
-                sess["first_ts"] = timestamp
-            if timestamp > sess["last_ts"]:
-                sess["last_ts"] = timestamp
-                sess["project"] = project
-                sess["project_name"] = Path(project).name if project else "(不明)"
-
-            if display:
-                sess["prompts"].append({"display": display, "timestamp": timestamp})
 
     sorted_sessions = sorted(sessions.values(), key=lambda s: s["last_ts"], reverse=True)
     return sorted_sessions[:count]
@@ -303,12 +374,16 @@ def main():
         "-s", "--summary", nargs="?", type=int, const=5, default=None,
         metavar="N", help="直近 N セッションを一覧表示し Claude で要約（デフォルト: 5）",
     )
+    parser.add_argument(
+        "--debug", action="store_true",
+        help="設定ファイルの読み込みとパス解決のデバッグ情報を表示",
+    )
 
     args = parser.parse_args()
 
     # --summary が指定された場合（一覧 + 要約）
     if args.summary is not None:
-        sessions = load_recent_sessions(args.summary)
+        sessions = load_recent_sessions(args.summary, debug=args.debug)
         if not sessions:
             return
         display_recent_sessions(sessions)
@@ -325,14 +400,18 @@ def main():
 
     # --recent が指定された場合（一覧のみ）
     if args.recent is not None:
-        sessions = load_recent_sessions(args.recent)
+        sessions = load_recent_sessions(args.recent, debug=args.debug)
         if sessions:
             display_recent_sessions(sessions)
         return
 
     # キーワード検索（既存機能）
     if args.keyword:
-        fuzzy_search_prompts(args.keyword)
+        fuzzy_search_prompts(args.keyword, debug=args.debug)
+        return
+
+    if args.debug:
+        load_target_dirs(debug=True)
         return
 
     parser.print_help()
