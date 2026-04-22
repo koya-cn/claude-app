@@ -323,6 +323,25 @@ def format_timestamp(ts_ms):
     return dt.strftime("%m/%d %H:%M")
 
 
+def _group_turns(messages):
+    """messages を (user_msg, ai_msg) のターンリストにグループ化する"""
+    turns = []
+    i = 0
+    while i < len(messages):
+        if messages[i][0] == 'user':
+            user_msg = messages[i]
+            ai_msg = None
+            if i + 1 < len(messages) and messages[i + 1][0] == 'assistant':
+                ai_msg = messages[i + 1]
+                i += 2
+            else:
+                i += 1
+            turns.append((user_msg, ai_msg))
+        else:
+            i += 1
+    return turns
+
+
 def display_recent_sessions(sessions):
     print(f"📋 直近のセッション ({len(sessions)}件)")
     print("=" * 60)
@@ -338,20 +357,23 @@ def display_recent_sessions(sessions):
 
         messages = sess.get("messages", [])
         if messages:
-            last_user = next((m for m in reversed(messages) if m[0] == 'user'), None)
-            last_ai   = next((m for m in reversed(messages) if m[0] == 'assistant'), None)
-
-            for icon, label, msg_data in [("🙋", "User", last_user), ("🤖", "AI  ", last_ai)]:
-                if not msg_data:
-                    continue
-                lines = [l for l in msg_data[1].split('\n') if l.strip()]
-                for line in lines[:5]:
-                    if len(line) > 72:
-                        line = line[:72] + "..."
-                    print(f"      {icon} {label}: {line}")
-                    icon, label = "  ", "    "
-                if len(lines) > 5:
-                    print(f"               ...")
+            all_turns = _group_turns(messages)
+            turns = all_turns[-5:]
+            turn_offset = len(all_turns) - len(turns) + 1
+            for t_idx, (user_msg, ai_msg) in enumerate(turns, turn_offset):
+                print(f"      ── Turn {t_idx} ──")
+                for icon, label, msg_data in [("🙋", "User", user_msg), ("🤖", "AI  ", ai_msg)]:
+                    if not msg_data:
+                        continue
+                    lines = [l for l in msg_data[1].split('\n') if l.strip()]
+                    cur_icon, cur_label = icon, label
+                    for line in lines[:5]:
+                        if len(line) > 72:
+                            line = line[:72] + "..."
+                        print(f"      {cur_icon} {cur_label}: {line}")
+                        cur_icon, cur_label = "  ", "    "
+                    if len(lines) > 5:
+                        print(f"               ...")
         else:
             if sess["prompts"]:
                 latest = max(sess["prompts"], key=lambda p: p["timestamp"])
@@ -386,12 +408,15 @@ def build_summary_prompt(sessions):
         messages = sess.get("messages", [])
         if messages:
             role_label = {"user": "User", "assistant": "AI"}
-            for role, text in messages[-6:]:
-                label = role_label.get(role, role)
-                text = text.replace("\n", " ").strip()
-                if len(text) > 100:
-                    text = text[:100] + "..."
-                lines.append(f"  [{label}] {text}")
+            for user_msg, ai_msg in _group_turns(messages)[-5:]:
+                for msg in [user_msg, ai_msg]:
+                    if not msg:
+                        continue
+                    label = role_label.get(msg[0], msg[0])
+                    text = msg[1].replace("\n", " ").strip()
+                    if len(text) > 100:
+                        text = text[:100] + "..."
+                    lines.append(f"  [{label}] {text}")
         else:
             sorted_prompts = sorted(sess["prompts"], key=lambda p: p["timestamp"], reverse=True)
             for p in sorted_prompts[:3]:
