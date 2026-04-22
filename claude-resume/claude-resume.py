@@ -267,7 +267,55 @@ def load_recent_sessions(count=5, debug=False):
         return []
 
     sorted_sessions = sorted(sessions.values(), key=lambda s: s["last_ts"], reverse=True)
-    return sorted_sessions[:count]
+    result = sorted_sessions[:count]
+    for sess in result:
+        sess["messages"] = load_session_messages(sess["session_id"], target_dirs)
+    return result
+
+
+def load_session_messages(session_id, target_dirs):
+    """セッションの全メッセージを (role, text) リストで返す"""
+    for base_dir in target_dirs:
+        projects_dir = base_dir / "projects"
+        if not projects_dir.exists():
+            continue
+        for project_dir in projects_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            jsonl_file = project_dir / f"{session_id}.jsonl"
+            if not jsonl_file.exists():
+                continue
+            messages = []
+            try:
+                with open(jsonl_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        msg = entry.get('message', {})
+                        if not msg:
+                            continue
+                        role = msg.get('role')
+                        content = msg.get('content', '')
+                        if isinstance(content, list):
+                            text = '\n'.join(
+                                c.get('text', '')
+                                for c in content
+                                if isinstance(c, dict) and c.get('type') == 'text'
+                            )
+                        else:
+                            text = str(content)
+                        text = text.strip()
+                        if role in ('user', 'assistant') and text:
+                            messages.append((role, text))
+            except (OSError, UnicodeDecodeError):
+                pass
+            return messages
+    return []
 
 
 def format_timestamp(ts_ms):
@@ -275,18 +323,30 @@ def format_timestamp(ts_ms):
     return dt.strftime("%m/%d %H:%M")
 
 
+def _group_turns(messages):
+    """messages を (user_msg, ai_msg) のターンリストにグループ化する"""
+    turns = []
+    i = 0
+    while i < len(messages):
+        if messages[i][0] == 'user':
+            user_msg = messages[i]
+            ai_msg = None
+            if i + 1 < len(messages) and messages[i + 1][0] == 'assistant':
+                ai_msg = messages[i + 1]
+                i += 2
+            else:
+                i += 1
+            turns.append((user_msg, ai_msg))
+        else:
+            i += 1
+    return turns
+
+
 def display_recent_sessions(sessions):
     print(f"📋 直近のセッション ({len(sessions)}件)")
     print("=" * 60)
 
     for i, sess in enumerate(sessions, 1):
-        last_prompt = ""
-        if sess["prompts"]:
-            latest = max(sess["prompts"], key=lambda p: p["timestamp"])
-            last_prompt = latest["display"]
-            if len(last_prompt) > 60:
-                last_prompt = last_prompt[:60] + "..."
-
         ts_str = format_timestamp(sess["last_ts"])
         project = sess["project"]
         project_name = sess["project_name"]
@@ -294,8 +354,34 @@ def display_recent_sessions(sessions):
         prompt_count = len(sess["prompts"])
 
         print(f" [{i:2}] {ts_str} | {project_name}")
-        if last_prompt:
-            print(f"      💬 {last_prompt}")
+
+        messages = sess.get("messages", [])
+        if messages:
+            all_turns = _group_turns(messages)
+            turns = all_turns[-5:]
+            turn_offset = len(all_turns) - len(turns) + 1
+            for t_idx, (user_msg, ai_msg) in enumerate(turns, turn_offset):
+                print(f"      ── Turn {t_idx} ──")
+                for icon, label, msg_data in [("🙋", "User", user_msg), ("🤖", "AI  ", ai_msg)]:
+                    if not msg_data:
+                        continue
+                    lines = [l for l in msg_data[1].split('\n') if l.strip()]
+                    cur_icon, cur_label = icon, label
+                    for line in lines[:5]:
+                        if len(line) > 72:
+                            line = line[:72] + "..."
+                        print(f"      {cur_icon} {cur_label}: {line}")
+                        cur_icon, cur_label = "  ", "    "
+                    if len(lines) > 5:
+                        print(f"               ...")
+        else:
+            if sess["prompts"]:
+                latest = max(sess["prompts"], key=lambda p: p["timestamp"])
+                last_prompt = latest["display"]
+                if len(last_prompt) > 60:
+                    last_prompt = last_prompt[:60] + "..."
+                print(f"      💬 {last_prompt}")
+
         print(f"      📝 {prompt_count} prompts")
         if project:
             print(f"      🚀 cd {project} && claude --resume {sid}")
@@ -319,12 +405,25 @@ def build_summary_prompt(sessions):
         project_name = sess["project_name"]
         lines.append(f"Session {i} ({project_name}, {ts_str}):")
 
-        sorted_prompts = sorted(sess["prompts"], key=lambda p: p["timestamp"], reverse=True)
-        for p in sorted_prompts[:3]:
-            text = p["display"].replace("\n", " ").strip()
-            if len(text) > 100:
-                text = text[:100] + "..."
-            lines.append(f"  - {text}")
+        messages = sess.get("messages", [])
+        if messages:
+            role_label = {"user": "User", "assistant": "AI"}
+            for user_msg, ai_msg in _group_turns(messages)[-5:]:
+                for msg in [user_msg, ai_msg]:
+                    if not msg:
+                        continue
+                    label = role_label.get(msg[0], msg[0])
+                    text = msg[1].replace("\n", " ").strip()
+                    if len(text) > 100:
+                        text = text[:100] + "..."
+                    lines.append(f"  [{label}] {text}")
+        else:
+            sorted_prompts = sorted(sess["prompts"], key=lambda p: p["timestamp"], reverse=True)
+            for p in sorted_prompts[:3]:
+                text = p["display"].replace("\n", " ").strip()
+                if len(text) > 100:
+                    text = text[:100] + "..."
+                lines.append(f"  - {text}")
         lines.append("")
 
     return "\n".join(lines)
