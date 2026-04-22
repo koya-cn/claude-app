@@ -436,7 +436,7 @@ def summarize_with_claude(prompt_text):
 
     try:
         result = subprocess.run(
-            ["claude", "-p", "--no-session-persistence"],
+            ["claude", "-p", "--model", "claude-haiku-4-5-20251001", "--no-session-persistence"],
             input=prompt_text,
             capture_output=True,
             text=True,
