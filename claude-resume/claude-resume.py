@@ -285,14 +285,27 @@ def load_recent_sessions(count=5, debug=False):
         if sid not in sessions:
             sessions[sid] = entry
 
+    # ── /resume 等のスラッシュコマンドだけのセッションを除外 ──
+    _SKIP_CMDS = {'/resume', '/new', '/clear', '/help'}
+
+    def _is_slash_only(sess):
+        meaningful = [p["display"].strip() for p in sess.get("prompts", []) if p["display"].strip()]
+        return bool(meaningful) and all(d in _SKIP_CMDS for d in meaningful)
+
+    sessions = {sid: s for sid, s in sessions.items() if not _is_slash_only(s)}
+
     if not sessions:
         print("セッション履歴が見つかりません。")
         return []
 
     sorted_sessions = sorted(sessions.values(), key=lambda s: s["last_ts"], reverse=True)
-    result = sorted_sessions[:count]
-    for sess in result:
+    result = []
+    for sess in sorted_sessions:
         sess["messages"] = load_session_messages(sess["session_id"], target_dirs)
+        if sess["messages"]:
+            result.append(sess)
+        if len(result) >= count:
+            break
     return result
 
 
