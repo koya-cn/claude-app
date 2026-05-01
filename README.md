@@ -6,3 +6,4 @@ Claude用の自作App
 | ツール | 説明 |
 |--------|------|
 | [claude-resume](claude-resume/README.md) | Claude CLIの過去セッションをキーワード検索し、作業を再開するツール |
+| [statusline](statusline/README.md) | ステータスラインにプロジェクト名・gitブランチを表示するスクリプト |
