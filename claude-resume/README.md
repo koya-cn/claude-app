@@ -10,6 +10,7 @@ Claude CLI の過去のセッション履歴（`~/.claude/`）から、キーワ
 * **自動コマンド生成**: `cd <path> && claude --resume <id>` を出力。コピペで即復帰。
 * **直近セッション一覧**: `--recent` で「最近何をしていたか」を時系列で確認。
 * **Claude による要約**: `--summary` で直近の作業内容を Claude が自動要約。
+* **ブラウザUI**: `--web` でローカルブラウザから見やすいインターフェースで履歴を閲覧・検索。
 
 ## 🚀 インストール方法
 
@@ -36,6 +37,8 @@ claude-resume -r [N]             # 直近 N セッションの一覧（デフォ
 claude-resume --recent [N]       # 同上
 claude-resume -s [N]             # 直近 N セッションを一覧 + Claude 要約（デフォルト: 5）
 claude-resume --summary [N]      # 同上
+claude-resume -w [PORT]          # ブラウザUIを起動（デフォルトポート: 8080）
+claude-resume --web [PORT]       # 同上
 ```
 
 ### キーワード検索
@@ -82,6 +85,26 @@ claude-resume --summary [N]      # 同上
 2. wseminar2_live: スキルをグローバルからプロジェクト固有に移動する作業
 3. ...
 ```
+
+### ブラウザUI (`-w` / `--web`)
+
+```bash
+claude-resume -w
+# または
+claude-resume --web 3000  # ポート指定
+```
+
+ブラウザで `http://localhost:8080` が自動的に開き、以下の機能が利用できます：
+
+- **直近セッション一覧**: カード形式で見やすく表示
+- **ターン単位の会話表示**: User/AI のやり取りを折りたたみ表示
+- **キーワード検索**: リアルタイムで検索結果を表示
+- **コマンドコピー**: ワンクリックで `claude --resume` コマンドをコピー
+
+**特徴:**
+- 外部依存ゼロ（Python 標準ライブラリのみ）
+- レスポンシブデザイン
+- ローカル実行のみ（プライバシー保護）
 
 ## ⚙️ 設定ファイル (`~/.claude-resume.json`)
 
