@@ -887,12 +887,21 @@ const App = () => {
                   {new Date(openSession.last_ts).toLocaleString('ja-JP', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'})}
                 </span>
                 <span style={{marginLeft:'auto', display:'flex', gap:6}}>
-                  <button className="ld-btn primary"
+                  <button className="ld-btn orange"
                           onClick={() => launchTerminal(openSession.project, openSession.session_id)}>
-                    Resume ↵
+                    ターミナルで開く
                   </button>
                   <button className="ld-btn" onClick={() => setOpenSession(null)}>✕</button>
                 </span>
+              </div>
+              <div className="ld-cmd-row" style={{marginBottom:4}}>{(() => {
+                const proj = openSession.project && openSession.project !== '(Global/No Directory)' ? openSession.project : '';
+                const cmd = proj ? 'cd ' + proj + ' && claude --resume ' + openSession.session_id : 'claude --resume ' + openSession.session_id;
+                return (<>
+                  <span className="ld-cmd-text">{cmd}</span>
+                  <button className="ld-btn" onClick={() => copyToClipboard(cmd)}>コピー</button>
+                </>);
+              })()}
               </div>
               <div className="ld-sheet-title">{openSession.session_name || '(名前なし)'}</div>
               <div className="ld-sheet-meta">
