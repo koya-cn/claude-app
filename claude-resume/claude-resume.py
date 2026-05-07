@@ -466,6 +466,51 @@ def build_summary_prompt(sessions):
     return "\n".join(lines)
 
 
+def build_single_session_summary_prompt(messages):
+    """単一セッションの要約用プロンプトを生成。
+
+    先頭3ターン + 直近5ターンに絞り、各メッセージは500文字超を切り詰める。
+    """
+    turns = _group_turns(messages)
+    head_n, tail_n = 8, 5
+
+    if len(turns) <= head_n + tail_n:
+        selected = [(idx + 1, t) for idx, t in enumerate(turns)]
+        elided = False
+    else:
+        head = [(idx + 1, turns[idx]) for idx in range(head_n)]
+        tail = [(len(turns) - tail_n + idx + 1, turns[len(turns) - tail_n + idx]) for idx in range(tail_n)]
+        selected = head + tail
+        elided = True
+
+    role_label = {"user": "User", "assistant": "AI"}
+    lines = [
+        "以下は Claude CLI セッションの会話ログです。",
+        "セッション全体を通じて何をしていたかを、主要なトピックが複数ある場合はそれぞれ含めて、",
+        "日本語で 3〜5 行の箇条書きに簡潔にまとめてください。",
+        "前置きや締めの文は不要、箇条書きのみ出力してください。",
+        "",
+    ]
+
+    last_idx = None
+    for turn_idx, (user_msg, ai_msg) in selected:
+        if elided and last_idx is not None and turn_idx != last_idx + 1:
+            lines.append("(中略)")
+        lines.append(f"── Turn {turn_idx} ──")
+        for msg in (user_msg, ai_msg):
+            if not msg:
+                continue
+            label = role_label.get(msg[0], msg[0])
+            text = msg[1].strip()
+            if len(text) > 500:
+                text = text[:500] + "..."
+            lines.append(f"[{label}] {text}")
+        lines.append("")
+        last_idx = turn_idx
+
+    return "\n".join(lines)
+
+
 def summarize_with_claude(prompt_text):
     if not shutil.which("claude"):
         print("⚠️  `claude` コマンドが見つかりません。Claude CLI がインストール済みか確認してください。")
@@ -580,6 +625,13 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-msg-assistant .ld-msg-body { border-left-color: #f97316; }
   .ld-msg-assistant { margin-top: 8px; }
 
+  .ld-summary-panel { margin: 10px 18px 0; padding: 10px 14px; background: #0d1a0d; border: 1px solid #1a3a1a; border-radius: 6px; }
+  .ld-summary-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 10.5px; color: #22c55e; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; letter-spacing: 0.06em; }
+  .ld-summary-text { font-size: 12.5px; color: #c9f7c9; line-height: 1.7; white-space: pre-wrap; }
+  .ld-summary-footer { margin-top: 8px; display: flex; gap: 6px; align-items: center; }
+  .ld-summary-time { font-size: 10px; color: #4a6a4a; font-family: 'JetBrains Mono', monospace; }
+  .ld-summary-stale { font-size: 10px; color: #f97316; font-family: 'JetBrains Mono', monospace; }
+
   .ld-sr-container { padding: 16px; }
   .ld-sr-header { color: #888; font-size: 11px; margin-bottom: 12px; }
   .ld-search-result { background: #131316; border: 1px solid #1f1f23; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
@@ -613,6 +665,9 @@ const App = () => {
   const [openSession, setOpenSession] = React.useState(null);
   const [modalMessages, setModalMessages] = React.useState(null);
   const [loadingModal, setLoadingModal] = React.useState(false);
+  const [summary, setSummary] = React.useState(null);
+  const [summaryLoading, setSummaryLoading] = React.useState(false);
+  const [summaryStale, setSummaryStale] = React.useState(false);
 
   React.useEffect(() => {
     fetch('/api/sessions?n=50')
@@ -637,16 +692,62 @@ const App = () => {
 
   const clearSearch = () => { setQuery(''); setSearchResults(null); };
 
+  const SUMMARY_KEY = (sid) => `claude-resume:summary:${sid}`;
+
+  const loadCachedSummary = (sid, msgCount) => {
+    try {
+      const raw = localStorage.getItem(SUMMARY_KEY(sid));
+      if (!raw) return null;
+      const cached = JSON.parse(raw);
+      if (cached.message_count !== msgCount) return null;
+      return cached;
+    } catch (e) { return null; }
+  };
+
+  const saveSummaryCache = (sid, summaryText, msgCount) => {
+    try {
+      localStorage.setItem(SUMMARY_KEY(sid), JSON.stringify({
+        summary: summaryText,
+        message_count: msgCount,
+        generated_at: new Date().toISOString(),
+      }));
+    } catch (e) {}
+  };
+
   const openDetail = async (s) => {
     setOpenSession(s);
     setLoadingModal(true);
     setModalMessages(null);
+    setSummary(null);
+    setSummaryStale(false);
     try {
       const res = await fetch('/api/session/' + s.session_id);
       const data = await res.json();
-      setModalMessages(data.messages || []);
+      const msgs = data.messages || [];
+      setModalMessages(msgs);
+      // キャッシュ確認
+      const cached = loadCachedSummary(s.session_id, msgs.length);
+      if (cached) {
+        setSummary(cached);
+        setSummaryStale(false);
+      }
     } catch (e) { setModalMessages([]); }
     setLoadingModal(false);
+  };
+
+  const generateSummary = async (sessionId, msgCount) => {
+    setSummaryLoading(true);
+    setSummary(null);
+    try {
+      const res = await fetch('/api/summary?session_id=' + encodeURIComponent(sessionId));
+      const data = await res.json();
+      if (data.summary) {
+        const cached = { summary: data.summary, message_count: data.message_count, generated_at: new Date().toISOString() };
+        setSummary(cached);
+        saveSummaryCache(sessionId, data.summary, data.message_count);
+      }
+    } catch (e) {}
+    setSummaryLoading(false);
   };
 
   // 検索結果からモーダルを開く
@@ -910,6 +1011,37 @@ const App = () => {
                 <span>{openSession.messages ? openSession.messages.length : 0} msgs</span>
               </div>
             </div>
+
+            {/* AI 要約パネル */}
+            {!loadingModal && modalMessages !== null && (
+              <div className="ld-summary-panel">
+                <div className="ld-summary-header">
+                  <span>⚡ AI 要約</span>
+                </div>
+                {summaryLoading ? (
+                  <div style={{color:'#4a6a4a', fontSize:'12px'}}>要約を生成中…</div>
+                ) : summary ? (
+                  <>
+                    <div className="ld-summary-text">{summary.summary}</div>
+                    <div className="ld-summary-footer">
+                      <span className="ld-summary-time">
+                        {summary.generated_at ? new Date(summary.generated_at).toLocaleString('ja-JP', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}) + ' 生成' : ''}
+                      </span>
+                      <button className="ld-btn" style={{height:'20px', fontSize:'10px', padding:'0 7px'}}
+                              onClick={() => generateSummary(openSession.session_id, modalMessages.length)}>
+                        再生成
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <button className="ld-btn primary" style={{fontSize:'11.5px'}}
+                          onClick={() => generateSummary(openSession.session_id, modalMessages.length)}>
+                    AI 要約を生成
+                  </button>
+                )}
+              </div>
+            )}
+
             <div className="ld-transcript">
               {loadingModal
                 ? <div className="ld-loading">読み込み中…</div>
@@ -1048,6 +1180,35 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps({"messages": messages_json}, ensure_ascii=False).encode('utf-8'))
+
+        elif parsed.path == '/api/summary':
+            query = parse_qs(parsed.query)
+            session_id = query.get('session_id', [''])[0]
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            if not session_id:
+                self.wfile.write(json.dumps({"error": "session_id required"}, ensure_ascii=False).encode('utf-8'))
+                return
+
+            messages = load_session_messages(session_id, self.target_dirs)
+            if not messages:
+                self.wfile.write(json.dumps({"error": "session not found"}, ensure_ascii=False).encode('utf-8'))
+                return
+
+            prompt_text = build_single_session_summary_prompt(messages)
+            summary = summarize_with_claude(prompt_text)
+            if summary is None:
+                self.wfile.write(json.dumps({"error": "claude unavailable"}, ensure_ascii=False).encode('utf-8'))
+                return
+
+            self.wfile.write(json.dumps(
+                {"summary": summary, "message_count": len(messages)},
+                ensure_ascii=False
+            ).encode('utf-8'))
 
         else:
             self.send_response(404)
