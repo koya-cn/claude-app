@@ -668,12 +668,29 @@ const App = () => {
   const [summary, setSummary] = React.useState(null);
   const [summaryLoading, setSummaryLoading] = React.useState(false);
   const [summaryStale, setSummaryStale] = React.useState(false);
+  const [cachedSummaries, setCachedSummaries] = React.useState({});
 
   React.useEffect(() => {
     fetch('/api/sessions?n=50')
       .then(r => r.json())
       .then(data => { setSessions(data); setLoading(false); })
       .catch(() => setLoading(false));
+  }, []);
+
+  React.useEffect(() => {
+    const map = {};
+    const prefix = 'claude-resume:summary:';
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(prefix)) continue;
+      try {
+        const v = JSON.parse(localStorage.getItem(k));
+        if (v && typeof v.message_count === 'number') {
+          map[k.slice(prefix.length)] = v.message_count;
+        }
+      } catch {}
+    }
+    setCachedSummaries(map);
   }, []);
 
   const doSearch = async () => {
@@ -711,6 +728,7 @@ const App = () => {
         message_count: msgCount,
         generated_at: new Date().toISOString(),
       }));
+      setCachedSummaries(prev => ({ ...prev, [sid]: msgCount }));
     } catch (e) {}
   };
 
@@ -959,7 +977,13 @@ const App = () => {
                     <div key={s.session_id}
                          className={`ld-row ${i===selected ? 'sel' : ''}`}
                          onClick={() => { setSelected(i); openDetail(s); }}>
-                      <span className={`ld-status ${s.last_ts >= todayStart ? 'active' : 'idle'}`}></span>
+                      <span className={`ld-status ${
+                        cachedSummaries[s.session_id] === (s.messages ? s.messages.length : 0)
+                          ? 'active' : 'idle'
+                      }`} title={
+                        cachedSummaries[s.session_id] === (s.messages ? s.messages.length : 0)
+                          ? 'AI 要約済み' : ''
+                      }></span>
                       <span className="ld-proj" title={s.project}>{s.project_name}</span>
                       <span className="ld-title">
                         {s.session_name || '(名前なし)'}
@@ -1078,7 +1102,7 @@ const App = () => {
         <span><span className="kbd">↑↓</span> 移動</span>
         <span><span className="kbd">↵</span> 詳細</span>
         <span><span className="kbd">Esc</span> 閉じる</span>
-        <span style={{color:'#555', fontSize:'10px', marginLeft:8}}>● 今日のセッション</span>
+        <span style={{color:'#555', fontSize:'10px', marginLeft:8}}>● AI 要約済み</span>
         <span style={{marginLeft:'auto'}}>{filtered.length} / {sessions.length} sessions</span>
       </div>
     </div>
