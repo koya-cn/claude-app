@@ -5,6 +5,9 @@ input=$(cat)
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 branch=$(echo "$input" | jq -r '.git.branch // empty')
 
+# 選択中のモデル
+model=$(echo "$input" | jq -r '.model.display_name // empty')
+
 if [ -z "$cwd" ]; then
   cwd=$(pwd)
 fi
@@ -47,6 +50,11 @@ if [ -n "$project" ] && [ -n "$branch" ]; then
   out="${project} | ${branch}"
 elif [ -n "$project" ]; then
   out="${project}"
+fi
+
+if [ -n "$model" ]; then
+  [ -n "$out" ] && out="$out | "
+  out="${out}${model}"
 fi
 
 if [ -n "$five" ]; then
