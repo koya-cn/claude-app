@@ -511,29 +511,328 @@ def build_single_session_summary_prompt(messages):
     return "\n".join(lines)
 
 
-def summarize_with_claude(prompt_text):
-    if not shutil.which("claude"):
-        print("⚠️  `claude` コマンドが見つかりません。Claude CLI がインストール済みか確認してください。")
-        return None
+def summarize_with_claude(prompt_text, timeout=60):
+    """Claude(Haiku) で要約。成功時は (text, None)、失敗時は (None, 理由文字列) を返す。"""
+    claude_bin = shutil.which("claude")
+    if not claude_bin:
+        msg = "`claude` コマンドが見つかりません（PATH 未設定の可能性）。Claude CLI を確認してください。"
+        print(f"⚠️  {msg}")
+        return None, msg
 
     try:
         result = subprocess.run(
-            ["claude", "-p", "--model", "claude-haiku-4-5-20251001", "--no-session-persistence"],
+            [claude_bin, "-p", "--model", "claude-haiku-4-5-20251001", "--no-session-persistence"],
             input=prompt_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
-            timeout=60,
+            timeout=timeout,
         )
         if result.returncode != 0:
-            print(f"⚠️  Claude の呼び出しに失敗しました (exit {result.returncode})")
-            if result.stderr:
-                print(result.stderr[:200])
-            return None
-        return result.stdout.strip()
+            err = (result.stderr or "").strip()[:300]
+            msg = f"Claude 実行に失敗しました (exit {result.returncode}): {err}"
+            print(f"⚠️  {msg}")
+            return None, msg
+        return result.stdout.strip(), None
     except subprocess.TimeoutExpired:
-        print("⚠️  Claude の応答がタイムアウトしました（60秒）")
-        return None
+        msg = f"Claude の応答がタイムアウトしました（{timeout}秒）。候補が多い場合は --strict で件数を絞ってください。"
+        print(f"⚠️  {msg}")
+        return None, msg
+    except Exception as e:
+        msg = f"Claude 呼び出しでエラー: {e}"
+        print(f"⚠️  {msg}")
+        return None, msg
+
+
+# ─── 未完了検出（新機能） ─────────────────────────────────────────────────────
+
+# やり残しを示唆する表現（末尾AI発話に含まれると未完了の疑い）
+_LEFTOVER_PHRASES = [
+    "あとで", "後で", "残り", "残っ", "未実装", "未対応", "未完了", "未着手",
+    "次は", "次に", "TODO", "todo", "保留", "一旦", "ひとまず", "とりあえず",
+    "続き", "中断", "お願いします", "確認してください", "直して", "修正が必要",
+    # 外部・他者待ち（blocked）を示す表現
+    "対応待ち", "返答待ち", "確認待ち", "承認待ち", "結果待ち", "回答待ち",
+    "問い合わせ中", "ペンディング", "待っている間",
+    # 次工程・積み残しを示す表現（「〇〇完了。次は△△」型の取りこぼし対策）
+    "次のステップ", "次のフェーズ", "次セッション", "未処理",
+]
+# 質問・確認待ちで終わる語尾（弱シグナル）
+_QUESTION_TAILS = [
+    "?", "？", "ますか", "でしょうか", "どちら", "よろしい",
+    "進めて", "いいですか", "どうし", "教えてください",
+]
+# 完了報告を示す表現（末尾AI発話の末尾付近にあれば「完了」とみなす）
+_COMPLETION_PHRASES = [
+    "完了しました", "完了です", "完了！", "できました", "成功しました",
+    "マージしました", "マージ済み", "マージ完了", "デプロイしました",
+    "完成しました", "解決しました", "対応しました", "終わりました",
+    "問題ありません", "問題ないです", "正常に", "✅",
+    # commit / push / PR 作成も完了とみなす（ユーザー方針）。過去形に限定し
+    # 「PR作成しますか?」等の予定・質問を拾わないようにする。
+    "コミットしました", "コミット完了", "プッシュしました", "プッシュ完了",
+    "コミット・プッシュ", "PRを作成しました", "PR作成完了", "PRを出しました",
+    "プルリクを作成", "プルリクエストを作成", "PR を作成しました",
+]
+# スキル/コマンド実行ログ（ノイズ）: 初回ユーザー発話がこれで始まるものは除外
+_NOISE_PREFIXES = [
+    "# Observer Start", "# Instinct", "# Evolve", "# Usage Report",
+    "# Team", "# Code Review Workflow", "# Promote", "# Daily",
+    "/instinct", "/observer", "/evolve", "/usage-report", "/team-",
+    "IMPORTANT: You are running in non-interactive",
+]
+
+
+# メタメッセージ（コマンド展開・caveat・system-reminder 等）の先頭マーカー
+_META_PREFIXES = (
+    "<command-message>", "<command-name>", "<command-args>",
+    "<local-command-",  # stdout / stderr / caveat をまとめて除外
+    "<bash-", "<system-reminder>",
+    "Caveat: The messages below",
+)
+
+
+def _is_meta(text):
+    """ユーザー発話に紛れるメタ/コマンド注入メッセージか判定する。"""
+    t = text.strip()
+    return (not t) or t.startswith(_META_PREFIXES)
+
+
+def _first_line(text, maxlen=110):
+    """先頭の意味ある1行を抜き出す。"""
+    for line in text.split("\n"):
+        s = line.strip()
+        if s:
+            return (s[:maxlen] + "…") if len(s) > maxlen else s
+    return ""
+
+
+def _snippet_with(text, needle, maxlen=110):
+    """text の中で needle を含む行（なければ前後）を短く抜き出す。needle 無しは先頭行。"""
+    if not needle:
+        return _first_line(text, maxlen)
+    for line in text.split("\n"):
+        if needle in line:
+            s = line.strip()
+            return (s[:maxlen] + "…") if len(s) > maxlen else s
+    idx = text.find(needle)
+    if idx >= 0:
+        start = max(0, idx - 25)
+        s = text[start:idx + maxlen].strip().replace("\n", " ")
+        return ("…" if start > 0 else "") + s
+    return ""
+
+
+def _last_line(text, maxlen=110):
+    """末尾の意味ある1行を抜き出す。"""
+    for line in reversed(text.split("\n")):
+        s = line.strip()
+        if s:
+            return (s[:maxlen] + "…") if len(s) > maxlen else s
+    return ""
+
+
+def detect_incomplete(messages):
+    """(role, text) 列から未完了シグナルをヒューリスティック抽出する（2層判定）。
+
+    返り値: dict
+      is_candidate: 未完了の疑いがあるか
+      tier:         "strong"（明確なシグナル有） / "weak"（完了報告が無いだけ） / ""
+      signals:      検出根拠のリスト
+      evidence:     [{label, text}] 各シグナルが一致した実際の行（根拠）
+      strength:     優先度スコア（大きいほど未完了の確度が高い）
+      last_ai:      末尾AI発話の抜粋
+      intent:       最初の意味あるユーザー発話
+    """
+    empty = {"is_candidate": False, "tier": "", "signals": [], "evidence": [], "strength": 0, "last_ai": "", "intent": ""}
+    if not messages:
+        return empty
+
+    # メタ/コマンド注入メッセージを除いた実会話のみで判定する
+    cleaned = [(r, t) for (r, t) in messages if not _is_meta(t)]
+    if not cleaned:
+        return empty
+
+    # intent: 最初の意味あるユーザー発話
+    intent = ""
+    for role, text in cleaned:
+        if role == "user" and text.strip():
+            intent = text.strip()
+            break
+
+    # ノイズ（スキル実行ログ等）は除外
+    if any(intent.startswith(p) for p in _NOISE_PREFIXES):
+        return {**empty, "intent": intent}
+
+    last_role, last_text = cleaned[-1]
+    last_ai = ""
+    for role, text in cleaned:
+        if role == "assistant" and text.strip():
+            last_ai = text
+
+    signals = []
+    evidence = []
+    strength = 0
+
+    # 1) 末尾がユーザー発言（AIが応答せず終了）
+    if last_role == "user" and last_text.strip():
+        signals.append("AI未応答で終了")
+        evidence.append({"label": "未応答のまま終了した発言", "text": _snippet_with(last_text, "")})
+        strength += 3
+
+    # 2) やり残しを示唆する表現が末尾AI発話に含まれる
+    hit_pos = sorted((last_ai.find(w), w) for w in _LEFTOVER_PHRASES if w in last_ai)
+    if hit_pos:
+        hit_words = [w for _, w in hit_pos]
+        signals.append("やり残し表現: " + ", ".join(sorted(set(hit_words))[:5]))
+        evidence.append({"label": "一致した行", "text": _snippet_with(last_ai, hit_words[0])})
+        strength += 2
+
+    # 3) 末尾AI発話に未チェックのチェックリスト（- [ ]）が残っている
+    if "[ ]" in last_ai:
+        signals.append("未対応のチェックリスト項目あり")
+        evidence.append({"label": "未チェック項目", "text": _snippet_with(last_ai, "[ ]")})
+        strength += 2
+
+    # 4) 質問・確認待ちで終了（弱シグナル）
+    tail = last_ai.strip()[-40:]
+    if last_role == "assistant" and any(q in tail for q in _QUESTION_TAILS):
+        signals.append("確認/承認待ち")
+        evidence.append({"label": "末尾の問いかけ", "text": _last_line(last_ai)})
+        strength += 1
+
+    result = {
+        "last_ai": last_ai[-300:].strip(),
+        "intent": intent[:160],
+    }
+
+    # ── strong: 明確なシグナルあり ──
+    if signals:
+        return {**result, "is_candidate": True, "tier": "strong",
+                "signals": signals, "evidence": evidence, "strength": strength}
+
+    # ── weak: シグナルは無いが「完了報告」も無い（＝言い切れていない） ──
+    # 完了報告で締めくくられていれば完了とみなして除外
+    done_tail = last_ai.strip()[-120:]
+    if any(p in done_tail for p in _COMPLETION_PHRASES):
+        return {**result, "is_candidate": False, "tier": "", "signals": [], "evidence": [], "strength": 0}
+    # 極端に短い問い（雑談・あいさつ・一問一答）は weak からも除外
+    if len(intent.strip()) < 8:
+        return {**result, "is_candidate": False, "tier": "", "signals": [], "evidence": [], "strength": 0}
+
+    return {**result, "is_candidate": True, "tier": "weak",
+            "signals": ["完了報告なし"],
+            "evidence": [{"label": "末尾AI発話", "text": _last_line(last_ai)}],
+            "strength": 0}
+
+
+def scan_incomplete_sessions(limit=200, strict=False, debug=False):
+    """全セッションを走査し、未完了候補を優先度（strength→新しさ）順で返す。
+
+    strict=True のときは tier="strong"（明確なシグナル有）のみを返す。
+    strict=False（既定）は weak（完了報告が無いだけ）も含めた高リコール。
+    """
+    sessions = load_recent_sessions(limit, debug=debug)
+    candidates = []
+    for sess in sessions:
+        info = detect_incomplete(sess.get("messages", []))
+        if not info["is_candidate"]:
+            continue
+        if strict and info["tier"] != "strong":
+            continue
+        candidates.append({
+            "session_id":   sess["session_id"],
+            "project":      sess["project"],
+            "project_name": sess["project_name"],
+            "session_name": sess.get("session_name", ""),
+            "last_ts":      sess["last_ts"],
+            "tier":         info["tier"],
+            "signals":      info["signals"],
+            "evidence":     info.get("evidence", []),
+            "strength":     info["strength"],
+            "last_ai":      info["last_ai"],
+            "intent":       info["intent"],
+        })
+    candidates.sort(key=lambda c: (c["strength"], c["last_ts"]), reverse=True)
+    return candidates
+
+
+def incomplete_signature(candidates):
+    """候補集合の同一性を表す署名。キャッシュ無効化判定に使う。"""
+    parts = [f'{c["session_id"]}:{c["last_ts"]}' for c in candidates]
+    return f"{len(candidates)}|" + "|".join(sorted(parts))
+
+
+def build_incomplete_triage_prompt(candidates):
+    """未完了候補を Claude に渡してトリアージ（分類・ノイズ除去）させるプロンプト。"""
+    lines = [
+        "以下は Claude CLI のセッションのうち、未完了の疑いがあるものの一覧です。",
+        "各セッションが本当に「やり残し」かを判断し、ノイズ（会話の自然な終了・",
+        "質問への回答済み・既に完了）は除外してください。",
+        "残ったものを次の3カテゴリに分類し、優先度の高い順に日本語の箇条書きで出力してください。",
+        "  A: 中断・保留中（再開待ち）",
+        "  B: ほぼ完了・最終工程が残る（PR作成 / マージ / 実機確認 など）",
+        "  C: 議論・調査のみで未着手",
+        "各行フォーマット: `[A] プロジェクト名: 内容（残作業）`",
+        "signals が「完了報告なし」のみの候補は確信度が低い。明確に完了済み・雑談・",
+        "回答済みなら遠慮なく除外してよい。",
+        "前置きや締めの文は不要。箇条書きのみ出力してください。",
+        "",
+    ]
+    for i, c in enumerate(candidates, 1):
+        ts = format_timestamp(c["last_ts"])
+        tier = c.get("tier", "")
+        lines.append(f"Session {i} ({c['project_name']}, {ts}, tier={tier}):")
+        lines.append(f"  intent: {c['intent']}")
+        lines.append(f"  signals: {', '.join(c['signals'])}")
+        last_ai = c["last_ai"].replace("\n", " ").strip()
+        lines.append(f"  末尾AI: {last_ai[:300]}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _print_incomplete_item(i, c):
+    ts = format_timestamp(c["last_ts"])
+    print(f" [{i:2}] {ts} | {c['project_name']}  (強度 {c['strength']})")
+    intent = c["intent"]
+    if len(intent) > 70:
+        intent = intent[:70] + "..."
+    print(f"      💬 {intent}")
+    for s in c["signals"]:
+        print(f"      ⚠ {s}")
+    for ev in c.get("evidence", []):
+        if ev.get("text"):
+            print(f"         └ {ev['label']}: {ev['text']}")
+    if c["project"] and c["project"] != "(Global/No Directory)":
+        print(f"      🚀 cd {c['project']} && claude --resume {c['session_id']}")
+    else:
+        print(f"      🚀 claude --resume {c['session_id']}")
+    print("      " + "-" * 54)
+
+
+def display_incomplete(candidates):
+    """CLI 表示: 未完了候補の一覧（strong / weak の2層で区切る）。"""
+    strong = [c for c in candidates if c.get("tier") == "strong"]
+    weak = [c for c in candidates if c.get("tier") == "weak"]
+
+    print(f"⚠️  未完了の疑いがあるセッション ({len(candidates)}件)")
+    print("=" * 60)
+    if not candidates:
+        print("未完了の候補は見つかりませんでした。")
+        return
+
+    n = 0
+    if strong:
+        print(f"── 未完了のシグナルあり ({len(strong)}件) ──")
+        for c in strong:
+            n += 1
+            _print_incomplete_item(n, c)
+    if weak:
+        print()
+        print(f"── 完了報告のない作業（弱い候補・要確認 {len(weak)}件） ──")
+        for c in weak:
+            n += 1
+            _print_incomplete_item(n, c)
 
 
 # ─── Web UI 機能 ──────────────────────────────────────────────────────────────
@@ -645,6 +944,24 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-cmd-text { flex: 1; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #93c5fd; overflow-x: auto; white-space: nowrap; }
   .ld-btn.orange { background: #c2410c; border-color: #c2410c; color: #fff; }
   .ld-btn.orange:hover { background: #ea580c; border-color: #ea580c; }
+  .ld-btn.warn { border-color: #7c5410; color: #fbbf24; }
+  .ld-btn.warn:hover { background: #1f1709; border-color: #b8860b; }
+
+  .ld-inc-intro { background: #1a1709; border: 1px solid #3a2e0f; border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; }
+  .ld-inc-intro-title { font-size: 13px; color: #fbbf24; font-weight: 600; margin-bottom: 6px; }
+  .ld-inc-intro-desc { font-size: 11.5px; color: #b9a87a; line-height: 1.7; }
+  .ld-inc-strength { font-size: 10px; color: #fbbf24; background: #2a2109; padding: 2px 6px; border-radius: 3px; margin-left: 8px; font-family: 'JetBrains Mono', monospace; }
+  .ld-inc-signals { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .ld-inc-sig { font-size: 10.5px; color: #f0b35a; background: #211a0a; border: 1px solid #3a2e0f; padding: 2px 7px; border-radius: 3px; }
+  .ld-inc-weak { margin-top: 16px; border-top: 1px dashed #2a2620; padding-top: 12px; }
+  .ld-inc-weak > summary { cursor: pointer; color: #b9a87a; font-size: 11.5px; padding: 4px 0; user-select: none; }
+  .ld-inc-weak > summary:hover { color: #fbbf24; }
+  .ld-inc-evidence { margin-top: 6px; font-size: 11px; color: #cbb88a; background: #16130b; border-left: 2px solid #7c5410; padding: 6px 10px; border-radius: 3px; line-height: 1.6; word-break: break-word; }
+  .ld-inc-evidence .lbl { color: #7c6b3f; margin-right: 6px; }
+  .ld-inc-cardsum { margin-top: 10px; padding: 8px 11px; background: #0d1a0d; border: 1px solid #1a3a1a; border-radius: 5px; }
+  .ld-inc-cardsum-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 10px; color: #22c55e; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; }
+  .ld-inc-cardsum-text { font-size: 12px; color: #c9f7c9; line-height: 1.65; white-space: pre-wrap; }
+  .ld-inc-error { font-size: 11px; color: #fca5a5; background: #1f0d0d; border: 1px solid #3a1a1a; border-radius: 4px; padding: 6px 9px; line-height: 1.6; word-break: break-word; }
 </style>
 <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
 <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
@@ -669,6 +986,22 @@ const App = () => {
   const [summaryLoading, setSummaryLoading] = React.useState(false);
   const [summaryStale, setSummaryStale] = React.useState(false);
   const [cachedSummaries, setCachedSummaries] = React.useState({});
+
+  // 未完了検出ビュー
+  const [view, setView] = React.useState('sessions'); // 'sessions' | 'incomplete'
+  const [incCandidates, setIncCandidates] = React.useState(null);
+  const [incLoading, setIncLoading] = React.useState(false);
+  const [incSignature, setIncSignature] = React.useState('');
+  const [incTriage, setIncTriage] = React.useState(null);
+  const [incTriageLoading, setIncTriageLoading] = React.useState(false);
+  const [incTriageStale, setIncTriageStale] = React.useState(false);
+  const [incTriageError, setIncTriageError] = React.useState('');
+  // 未完カードごとのセッション要約（TOPの要約と localStorage を共有）
+  const [cardSummaries, setCardSummaries] = React.useState({});
+  const [cardSummaryLoading, setCardSummaryLoading] = React.useState({});
+  const [cardSummaryError, setCardSummaryError] = React.useState({});
+
+  const INC_KEY = 'claude-resume:incomplete:v1';
 
   React.useEffect(() => {
     fetch('/api/sessions?n=50')
@@ -766,6 +1099,140 @@ const App = () => {
       }
     } catch (e) {}
     setSummaryLoading(false);
+  };
+
+  // ── 未完了検出ビュー ──
+  const loadIncompleteCache = () => {
+    try {
+      const raw = localStorage.getItem(INC_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  };
+
+  const saveIncompleteCache = (signature, triageText) => {
+    try {
+      localStorage.setItem(INC_KEY, JSON.stringify({
+        signature, summary: triageText, generated_at: new Date().toISOString(),
+      }));
+    } catch (e) {}
+  };
+
+  const openIncomplete = async () => {
+    setView('incomplete');
+    clearSearch();
+    setIncLoading(true);
+    setIncTriage(null);
+    setIncTriageStale(false);
+    try {
+      const res = await fetch('/api/incomplete');
+      const data = await res.json();
+      const cands = data.candidates || [];
+      setIncCandidates(cands);
+      setIncSignature(data.signature || '');
+      // TOP一覧/詳細で生成済みのセッション要約があれば未完カードにも反映
+      const sm = {};
+      cands.forEach(c => {
+        try {
+          const raw = localStorage.getItem(SUMMARY_KEY(c.session_id));
+          if (raw) { const v = JSON.parse(raw); if (v && v.summary) sm[c.session_id] = v.summary; }
+        } catch (e) {}
+      });
+      setCardSummaries(sm);
+      // キャッシュ済みトリアージがあり署名一致なら即表示
+      const cached = loadIncompleteCache();
+      if (cached && cached.signature === data.signature) {
+        setIncTriage(cached);
+        setIncTriageStale(false);
+      } else if (cached) {
+        setIncTriageStale(true); // 候補集合が変化 → 再生成を促す
+      }
+    } catch (e) { setIncCandidates([]); }
+    setIncLoading(false);
+  };
+
+  const generateTriage = async () => {
+    setIncTriageLoading(true);
+    setIncTriage(null);
+    setIncTriageError('');
+    try {
+      const res = await fetch('/api/incomplete/summary');
+      const data = await res.json();
+      if (data.error) {
+        setIncTriageError(data.error);
+      } else if (data.summary !== undefined) {
+        const cached = { signature: data.signature, summary: data.summary, generated_at: new Date().toISOString() };
+        setIncTriage(cached);
+        setIncTriageStale(false);
+        setIncSignature(data.signature || '');
+        saveIncompleteCache(data.signature, data.summary);
+      }
+    } catch (e) { setIncTriageError('トリアージの取得に失敗しました: ' + e); }
+    setIncTriageLoading(false);
+  };
+
+  // 未完カードからセッション要約を生成（/api/summary を再利用、TOPとキャッシュ共有）
+  const generateSummaryForCard = async (sid) => {
+    setCardSummaryLoading(prev => ({ ...prev, [sid]: true }));
+    setCardSummaryError(prev => ({ ...prev, [sid]: '' }));
+    try {
+      const res = await fetch('/api/summary?session_id=' + encodeURIComponent(sid));
+      const data = await res.json();
+      if (data.summary) {
+        saveSummaryCache(sid, data.summary, data.message_count);
+        setCardSummaries(prev => ({ ...prev, [sid]: data.summary }));
+      } else if (data.error) {
+        setCardSummaryError(prev => ({ ...prev, [sid]: data.error }));
+      }
+    } catch (e) { setCardSummaryError(prev => ({ ...prev, [sid]: '要約取得に失敗: ' + e })); }
+    setCardSummaryLoading(prev => ({ ...prev, [sid]: false }));
+  };
+
+  const renderIncCard = (c, i) => {
+    const proj = c.project && c.project !== '(Global/No Directory)' ? c.project : '';
+    const cmd = proj
+      ? 'cd ' + proj + ' && claude --resume ' + c.session_id
+      : 'claude --resume ' + c.session_id;
+    return (
+      <div key={c.session_id + i} className="ld-search-result">
+        <span className="ld-proj" title={c.project}>{c.project_name}</span>
+        <span className="ld-sr-time" style={{marginLeft:8}}>{relTime(c.last_ts)}</span>
+        <span className="ld-inc-strength" title="未完了スコア">強度 {c.strength}</span>
+        <div className="ld-sr-text" style={{marginTop:8}}>{c.intent}</div>
+        <div className="ld-inc-signals">
+          {(c.signals || []).map((s, j) => <span key={j} className="ld-inc-sig">{s}</span>)}
+        </div>
+        {(c.evidence || []).filter(ev => ev.text).map((ev, j) => (
+          <div key={j} className="ld-inc-evidence"><span className="lbl">{ev.label}:</span>{ev.text}</div>
+        ))}
+        <div className="ld-sr-actions">
+          <button className="ld-btn orange" onClick={() => launchTerminal(proj, c.session_id)}>ターミナルで開く</button>
+          <div className="ld-cmd-row">
+            <span className="ld-cmd-text">{cmd}</span>
+            <button className="ld-btn" onClick={() => copyToClipboard(cmd)}>コピー</button>
+          </div>
+        </div>
+        {cardSummaries[c.session_id] ? (
+          <div className="ld-inc-cardsum">
+            <div className="ld-inc-cardsum-head">
+              <span>⚡ AI 要約</span>
+              <button className="ld-btn" style={{height:'18px', fontSize:'9.5px', padding:'0 6px'}}
+                      disabled={cardSummaryLoading[c.session_id]}
+                      onClick={() => generateSummaryForCard(c.session_id)}>再生成</button>
+            </div>
+            <div className="ld-inc-cardsum-text">{cardSummaries[c.session_id]}</div>
+          </div>
+        ) : (
+          <>
+            <button className="ld-btn" style={{marginTop:8, fontSize:'10.5px'}}
+                    disabled={cardSummaryLoading[c.session_id]}
+                    onClick={() => generateSummaryForCard(c.session_id)}>
+              {cardSummaryLoading[c.session_id] ? '要約生成中…' : (cardSummaryError[c.session_id] ? '⚡ 再試行' : '⚡ このセッションを要約')}
+            </button>
+            {cardSummaryError[c.session_id] && <div className="ld-inc-error" style={{marginTop:6}}>⚠ {cardSummaryError[c.session_id]}</div>}
+          </>
+        )}
+      </div>
+    );
   };
 
   // 検索結果からモーダルを開く
@@ -876,7 +1343,8 @@ const App = () => {
   return (
     <div className="ld-root">
       <div className="ld-top">
-        <div className="ld-logo">
+        <div className="ld-logo" style={{cursor:'pointer'}} title="一覧（TOP）へ"
+             onClick={() => { setView('sessions'); clearSearch(); }}>
           <span className="sq"></span>
           Claude Resume
         </div>
@@ -897,10 +1365,89 @@ const App = () => {
           <button className="ld-btn primary" onClick={doSearch} disabled={searching}>
             {searching ? '検索中…' : '検索'}
           </button>
+          {view === 'incomplete'
+            ? <button className="ld-btn" onClick={() => setView('sessions')}>← 一覧へ戻る</button>
+            : <button className="ld-btn warn" onClick={openIncomplete}>⚠ 未完了を調べる</button>
+          }
         </div>
       </div>
 
       <div className="ld-main">
+        {view === 'incomplete' ? (
+          <div className="ld-list">
+            <div className="ld-sr-container">
+              <div className="ld-inc-intro">
+                <div className="ld-inc-intro-title">⚠ 未完了の作業を調べる</div>
+                <div className="ld-inc-intro-desc">
+                  過去の Claude セッションを走査し、「やり残し」の疑いがある作業を検出します
+                  （AI未応答で終了・やり残し表現・確認待ちなどを手がかりに抽出）。
+                  下の一覧はヒューリスティック検出の候補です。「AIでトリアージ」を押すと、
+                  ノイズを除外し A:中断/保留・B:最終工程残り・C:未着手 に分類した要約を生成します。
+                  結果はブラウザに保存され、次回は即表示されます。
+                </div>
+              </div>
+
+              {/* トリアージ要約パネル */}
+              <div className="ld-summary-panel" style={{margin:'0 0 14px'}}>
+                <div className="ld-summary-header"><span>⚡ AI トリアージ</span></div>
+                {incTriageLoading ? (
+                  <div style={{color:'#4a6a4a', fontSize:'12px'}}>分類を生成中…（数十秒かかることがあります）</div>
+                ) : incTriage ? (
+                  <>
+                    <div className="ld-summary-text">{incTriage.summary || '（該当なし）'}</div>
+                    <div className="ld-summary-footer">
+                      <span className="ld-summary-time">
+                        {incTriage.generated_at ? new Date(incTriage.generated_at).toLocaleString('ja-JP', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}) + ' 生成' : ''}
+                      </span>
+                      {incTriageStale && <span className="ld-summary-stale">候補が変化しています</span>}
+                      <button className="ld-btn" style={{height:'20px', fontSize:'10px', padding:'0 7px'}}
+                              onClick={generateTriage}>再生成</button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {incTriageStale && <div className="ld-summary-stale" style={{marginBottom:6}}>前回から候補が変化しています。再生成してください。</div>}
+                    {incTriageError && <div className="ld-inc-error" style={{marginBottom:6}}>⚠ {incTriageError}</div>}
+                    <button className="ld-btn primary" style={{fontSize:'11.5px'}}
+                            onClick={generateTriage}
+                            disabled={!incCandidates || incCandidates.length === 0}>
+                      {incTriageError ? '再試行' : 'AI でトリアージ'}
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {(() => {
+                if (incLoading) {
+                  return <><div className="ld-sr-header">スキャン中…</div><div className="ld-loading">セッションを走査中…</div></>;
+                }
+                const cands = incCandidates || [];
+                if (cands.length === 0) {
+                  return <div className="ld-loading">未完了の候補は見つかりませんでした 🎉</div>;
+                }
+                const strong = cands.filter(c => c.tier === 'strong');
+                const weak = cands.filter(c => c.tier === 'weak');
+                return (
+                  <>
+                    <div className="ld-sr-header">
+                      未完了のシグナルあり: {strong.length}件{weak.length ? `（ほか 完了報告のない作業 ${weak.length}件）` : ''}
+                    </div>
+                    {strong.map((c, i) => renderIncCard(c, i))}
+                    {weak.length > 0 && (
+                      <details className="ld-inc-weak">
+                        <summary>完了報告のない作業をさらに表示（{weak.length}件・要確認）</summary>
+                        <div style={{marginTop:10}}>
+                          {weak.map((c, i) => renderIncCard(c, 'w' + i))}
+                        </div>
+                      </details>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+          </div>
+        ) : (
+        <>
         <div className="ld-side">
           <div className="grp">Filters</div>
           <div
@@ -997,6 +1544,8 @@ const App = () => {
             </>
           )}
         </div>
+        </>
+        )}
       </div>
 
       {openSession && (
@@ -1205,6 +1754,52 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"messages": messages_json}, ensure_ascii=False).encode('utf-8'))
 
+        elif parsed.path == '/api/incomplete':
+            # 全セッションを走査して未完了候補を返す（ヒューリスティック・軽量）
+            query = parse_qs(parsed.query)
+            strict = query.get('strict', ['0'])[0] in ('1', 'true')
+            candidates = scan_incomplete_sessions(200, strict=strict, debug=self.debug)
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "candidates": candidates,
+                "signature": incomplete_signature(candidates),
+            }, ensure_ascii=False).encode('utf-8'))
+
+        elif parsed.path == '/api/incomplete/summary':
+            # 未完了候補を Claude(Haiku) でトリアージ・分類した結果を返す
+            query = parse_qs(parsed.query)
+            strict = query.get('strict', ['0'])[0] in ('1', 'true')
+            candidates = scan_incomplete_sessions(200, strict=strict, debug=self.debug)
+            signature = incomplete_signature(candidates)
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+
+            if not candidates:
+                self.wfile.write(json.dumps(
+                    {"summary": "", "signature": signature, "count": 0},
+                    ensure_ascii=False).encode('utf-8'))
+                return
+
+            prompt_text = build_incomplete_triage_prompt(candidates)
+            # 候補数に応じてタイムアウトを延長（大きいプロンプト対策）
+            timeout = 90 + 2 * len(candidates)
+            summary, err = summarize_with_claude(prompt_text, timeout=timeout)
+            if summary is None:
+                self.wfile.write(json.dumps(
+                    {"error": err or "claude unavailable", "signature": signature},
+                    ensure_ascii=False).encode('utf-8'))
+                return
+
+            self.wfile.write(json.dumps(
+                {"summary": summary, "signature": signature, "count": len(candidates)},
+                ensure_ascii=False).encode('utf-8'))
+
         elif parsed.path == '/api/summary':
             query = parse_qs(parsed.query)
             session_id = query.get('session_id', [''])[0]
@@ -1224,9 +1819,9 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
                 return
 
             prompt_text = build_single_session_summary_prompt(messages)
-            summary = summarize_with_claude(prompt_text)
+            summary, err = summarize_with_claude(prompt_text)
             if summary is None:
-                self.wfile.write(json.dumps({"error": "claude unavailable"}, ensure_ascii=False).encode('utf-8'))
+                self.wfile.write(json.dumps({"error": err or "claude unavailable"}, ensure_ascii=False).encode('utf-8'))
                 return
 
             self.wfile.write(json.dumps(
@@ -1312,6 +1907,18 @@ def main():
         metavar="PORT", help="ブラウザUIを起動（デフォルトポート: 8080）",
     )
     parser.add_argument(
+        "-t", "--todo", nargs="?", type=int, const=200, default=None,
+        metavar="N", help="未完了の疑いがあるセッションを検出して一覧（最大 N 件走査、デフォルト: 200）",
+    )
+    parser.add_argument(
+        "--ai", action="store_true",
+        help="--todo と併用: Claude(Haiku) でA/B/Cに分類・トリアージしたレポートを出力",
+    )
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="--todo と併用: 明確なシグナルのある候補のみ表示（弱い候補=完了報告なしを除外）",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="設定ファイルの読み込みとパス解決のデバッグ情報を表示",
     )
@@ -1328,6 +1935,24 @@ def main():
             print(f"   別のポートを試してください: claude-resume --web <ポート番号>")
         return
 
+    # --todo が指定された場合（未完了検出）
+    if args.todo is not None:
+        candidates = scan_incomplete_sessions(args.todo, strict=args.strict, debug=args.debug)
+        display_incomplete(candidates)
+        if args.ai and candidates:
+            print()
+            print("🤖 Claude によるトリアージを生成中...")
+            prompt_text = build_incomplete_triage_prompt(candidates)
+            summary, err = summarize_with_claude(prompt_text, timeout=90 + 2 * len(candidates))
+            if summary:
+                print()
+                print("🤖 トリアージ結果（A: 中断/保留, B: 最終工程残り, C: 未着手）:")
+                print("=" * 60)
+                print(summary)
+            elif err:
+                print(f"⚠️  {err}")
+        return
+
     # --summary が指定された場合（一覧 + 要約）
     if args.summary is not None:
         sessions = load_recent_sessions(args.summary, debug=args.debug)
@@ -1337,12 +1962,14 @@ def main():
         print()
         print("🤖 Claude による要約を生成中...")
         prompt_text = build_summary_prompt(sessions)
-        summary = summarize_with_claude(prompt_text)
+        summary, err = summarize_with_claude(prompt_text)
         if summary:
             print()
             print("🤖 Claude による要約:")
             print("=" * 60)
             print(summary)
+        elif err:
+            print(f"⚠️  {err}")
         return
 
     # --recent が指定された場合（一覧のみ）
