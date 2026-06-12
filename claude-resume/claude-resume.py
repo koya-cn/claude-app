@@ -575,6 +575,38 @@ _COMPLETION_PHRASES = [
     "コミット・プッシュ", "PRを作成しました", "PR作成完了", "PRを出しました",
     "プルリクを作成", "プルリクエストを作成", "PR を作成しました",
 ]
+# 締めの確認質問（末尾付近にあれば「AIの回答に納得して終了」とみなし、未完から除外）
+# 「進めていいですか?」等のタスク続行の承認待ちとは区別する（あちらは未完シグナルとして残す）。
+_CLOSING_QUESTION_PHRASES = [
+    "解決しましたか", "うまくいきましたか", "うまくいったでしょうか",
+    "大丈夫ですか", "大丈夫でしょうか", "大丈夫でした",
+    "問題ないですか", "問題ありませんか", "問題なさそうですか", "問題なかったでしょうか",
+    "何をしますか", "どうしますか", "どうされますか", "どうしましょう",
+    "いかがしますか", "いかがでしょうか", "いかがですか",
+    "よろしいですか", "よろしいでしょうか",
+    "次は何", "他に何か", "他にご要望", "他に対応", "ほかに",
+    "どれにしますか", "どれを", "どちらにしますか",
+    "お手伝いしましょうか", "お手伝いできること", "お手伝いします",
+    "何かありますか", "何かあれば",
+]
+# 「残作業なし」を明示する表現。発話のどこかにあれば最優先で完了とみなし除外する
+# （別セッションへの引き継ぎで「続き」等のやり残し語が紛れても、本セッションは完了のため）。
+_DONE_OVERRIDE_PHRASES = [
+    "特に作業はありません", "特にやることはありません", "特に対応は不要",
+    "残作業はありません", "やり残しはありません", "対応不要です",
+    "もう用済み", "このセッションは終了", "すべて完了しました", "全て完了しました",
+]
+# ねぎらい・追加提案で締める表現（作業完了後の「あれば言ってください」型）
+_CLOSING_COURTESY_PHRASES = [
+    "お知らせください", "ご連絡ください", "お申し付けください",
+    "必要であれば", "必要でしたら", "必要に応じて", "必要なら",
+    "あればお知らせ", "あれば教えて", "ご要望があれば",
+    "気軽に", "遠慮なく",
+]
+# ユーザー主導の中断マーカー（末尾にあれば「納得して停止」とみなし除外）
+_INTERRUPT_PREFIXES = ("[Request interrupted",)
+# 番号付きメニュー行（「1. …」「2) …」等）。AIが選択肢を提示して待機している状態の判定に使う。
+_MENU_LINE_RE = re.compile(r"^\s*\d+\s*[.\)、）:：]")
 # スキル/コマンド実行ログ（ノイズ）: 初回ユーザー発話がこれで始まるものは除外
 _NOISE_PREFIXES = [
     "# Observer Start", "# Instinct", "# Evolve", "# Usage Report",
@@ -589,6 +621,7 @@ _META_PREFIXES = (
     "<command-message>", "<command-name>", "<command-args>",
     "<local-command-",  # stdout / stderr / caveat をまとめて除外
     "<bash-", "<system-reminder>",
+    "<task-notification>",  # バックグラウンドタスク完了通知（ユーザー発話ではない）
     "Caveat: The messages below",
 )
 
@@ -633,6 +666,34 @@ def _last_line(text, maxlen=110):
     return ""
 
 
+def _is_interrupt(text):
+    """ユーザーがツール実行/応答を中断したマーカーか判定する。"""
+    return text.strip().startswith(_INTERRUPT_PREFIXES)
+
+
+def _has_menu(text):
+    """末尾AI発話が番号付きの選択肢メニュー（2項目以上）を含むか判定する。"""
+    return sum(1 for ln in text.split("\n") if _MENU_LINE_RE.match(ln)) >= 2
+
+
+def _leftover_hits(last_ai, skip_menu_lines):
+    """末尾AI発話から「やり残し表現」の一致を行単位で収集する。
+
+    skip_menu_lines=True のときは番号付きメニュー行（提示された選択肢）を無視する。
+    返り値: [(出現位置, 一致語, その行)] を出現位置順に並べたもの。
+    """
+    hits = []
+    for line in last_ai.split("\n"):
+        if skip_menu_lines and _MENU_LINE_RE.match(line):
+            continue
+        for w in _LEFTOVER_PHRASES:
+            pos = line.find(w)
+            if pos >= 0:
+                hits.append((pos, w, line.strip()))
+    hits.sort()
+    return hits
+
+
 def detect_incomplete(messages):
     """(role, text) 列から未完了シグナルをヒューリスティック抽出する（2層判定）。
 
@@ -671,20 +732,50 @@ def detect_incomplete(messages):
         if role == "assistant" and text.strip():
             last_ai = text
 
+    result = {
+        "last_ai": last_ai[-300:].strip(),
+        "intent": intent[:160],
+    }
+
+    # 末尾がユーザー主導の中断 → 「納得して自分で停止した」とみなし除外する。
+    # （AIの応答途中をユーザーが止めたケース。やり残しではなく満足終了として扱う）
+    if last_role == "user" and _is_interrupt(last_text):
+        return {**empty, **result}
+
+    # 「特に作業はありません」等、残作業なしを明言していれば最優先で完了扱い。
+    if any(p in last_ai for p in _DONE_OVERRIDE_PHRASES):
+        return {**empty, **result}
+
+    # 末尾AI発話の「完了／締め」シグナルを先に評価しておく。
+    # ・完了報告は末尾付近に限らず発話全体を見る（「完了です。- 〜」のように冒頭で報告し
+    #   箇条書きが続くと末尾窓から外れて取りこぼすため）。
+    completion_hit = next((p for p in _COMPLETION_PHRASES if p in last_ai), None)
+    closing_zone = last_ai.strip()[-150:]
+    is_closing_q = any(p in closing_zone for p in _CLOSING_QUESTION_PHRASES)
+    has_courtesy = any(p in closing_zone for p in _CLOSING_COURTESY_PHRASES)
+
+    tail = last_ai.strip()[-40:]
+    ends_q = last_role == "assistant" and (
+        tail.endswith(("?", "？")) or any(q in tail for q in _QUESTION_TAILS)
+    )
+    # AIが番号付きメニューを提示して「何をしますか?」と待機している＝次トピック待ちの待機状態。
+    is_idle_menu = ends_q and _has_menu(last_ai)
+
     signals = []
     evidence = []
     strength = 0
 
-    # 1) 末尾がユーザー発言（AIが応答せず終了）
+    # 1) 末尾がユーザー発言（AIが応答せず終了）。中断マーカーは上で除外済み。
     if last_role == "user" and last_text.strip():
         signals.append("AI未応答で終了")
         evidence.append({"label": "未応答のまま終了した発言", "text": _snippet_with(last_text, "")})
         strength += 3
 
-    # 2) やり残しを示唆する表現が末尾AI発話に含まれる
-    hit_pos = sorted((last_ai.find(w), w) for w in _LEFTOVER_PHRASES if w in last_ai)
-    if hit_pos:
-        hit_words = [w for _, w in hit_pos]
+    # 2) やり残しを示唆する表現が末尾AI発話に含まれる。
+    #    メニュー待機中は提示された選択肢（番号付き行）の語を拾わない（「2. 続きの調査」等）。
+    hits = _leftover_hits(last_ai, skip_menu_lines=is_idle_menu)
+    if hits:
+        hit_words = [w for _, w, _ in hits]
         signals.append("やり残し表現: " + ", ".join(sorted(set(hit_words))[:5]))
         evidence.append({"label": "一致した行", "text": _snippet_with(last_ai, hit_words[0])})
         strength += 2
@@ -695,31 +786,25 @@ def detect_incomplete(messages):
         evidence.append({"label": "未チェック項目", "text": _snippet_with(last_ai, "[ ]")})
         strength += 2
 
-    # 4) 質問・確認待ちで終了（弱シグナル）
-    tail = last_ai.strip()[-40:]
-    if last_role == "assistant" and any(q in tail for q in _QUESTION_TAILS):
+    # 4) 質問・確認待ちで終了（弱シグナル）。ただし以下は「満足終了」とみなし除外:
+    #    ・締めの確認質問（解決しましたか? 等）  ・メニュー待機  ・作業完了報告のあとの確認
+    if ends_q and not (is_closing_q or is_idle_menu or completion_hit):
         signals.append("確認/承認待ち")
         evidence.append({"label": "末尾の問いかけ", "text": _last_line(last_ai)})
         strength += 1
-
-    result = {
-        "last_ai": last_ai[-300:].strip(),
-        "intent": intent[:160],
-    }
 
     # ── strong: 明確なシグナルあり ──
     if signals:
         return {**result, "is_candidate": True, "tier": "strong",
                 "signals": signals, "evidence": evidence, "strength": strength}
 
-    # ── weak: シグナルは無いが「完了報告」も無い（＝言い切れていない） ──
-    # 完了報告で締めくくられていれば完了とみなして除外
-    done_tail = last_ai.strip()[-120:]
-    if any(p in done_tail for p in _COMPLETION_PHRASES):
-        return {**result, "is_candidate": False, "tier": "", "signals": [], "evidence": [], "strength": 0}
+    # ── weak: 明確なシグナルは無い候補。以下のいずれかで締めていれば完了とみなし除外 ──
+    #    ・完了報告  ・締めの確認質問  ・メニュー待機  ・ねぎらい/追加提案（必要なら〜）
+    if completion_hit or is_closing_q or is_idle_menu or has_courtesy:
+        return {**empty, **result}
     # 極端に短い問い（雑談・あいさつ・一問一答）は weak からも除外
     if len(intent.strip()) < 8:
-        return {**result, "is_candidate": False, "tier": "", "signals": [], "evidence": [], "strength": 0}
+        return {**empty, **result}
 
     return {**result, "is_candidate": True, "tier": "weak",
             "signals": ["完了報告なし"],
@@ -777,8 +862,16 @@ def build_incomplete_triage_prompt(candidates):
         "  A: 中断・保留中（再開待ち）",
         "  B: ほぼ完了・最終工程が残る（PR作成 / マージ / 実機確認 など）",
         "  C: 議論・調査のみで未着手",
-        "signals が「完了報告なし」のみの候補は確信度が低い。明確に完了済み・雑談・",
-        "回答済みなら遠慮なく除外してよい（配列に含めない）。",
+        "",
+        "【除外（配列に含めない）の判断基準】次のいずれかに当てはまれば「完了」とみなす:",
+        "  ・末尾AIが作業完了を報告している（できました / 完了 / マージ・コミット・プッシュ済み等）",
+        "  ・AIの回答や成果物提示でユーザーが納得し、自然に会話が終わっている",
+        "  ・末尾が締めの確認/提案質問（解決しましたか? / 何をしますか? / 必要ならお知らせください 等）",
+        "  ・AIが番号付きの選択肢メニューを出して次の指示を待っているだけ",
+        "  ・残作業は別セッションへ引き継ぎ済み、または「特に作業はありません」と明言",
+        "逆に A/B/C に残すのは、タスク続行の明確な承認待ち・実装/対応のやり残し・",
+        "外部待ち(blocked)・未対応のチェックリスト項目が実際に残っている場合に限る。",
+        "signals が「完了報告なし」のみの候補は確信度が低い。迷ったら除外してよい。",
         "",
         "出力は JSON 配列のみ。前置き・説明・コードフェンス(```)は一切付けないこと。",
         '各要素の形式: {"n": セッション番号(整数), "cat": "A" | "B" | "C", "note": "残作業を簡潔に(日本語・60字以内)"}',
