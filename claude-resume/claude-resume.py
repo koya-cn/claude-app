@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -574,6 +575,38 @@ _COMPLETION_PHRASES = [
     "コミット・プッシュ", "PRを作成しました", "PR作成完了", "PRを出しました",
     "プルリクを作成", "プルリクエストを作成", "PR を作成しました",
 ]
+# 締めの確認質問（末尾付近にあれば「AIの回答に納得して終了」とみなし、未完から除外）
+# 「進めていいですか?」等のタスク続行の承認待ちとは区別する（あちらは未完シグナルとして残す）。
+_CLOSING_QUESTION_PHRASES = [
+    "解決しましたか", "うまくいきましたか", "うまくいったでしょうか",
+    "大丈夫ですか", "大丈夫でしょうか", "大丈夫でした",
+    "問題ないですか", "問題ありませんか", "問題なさそうですか", "問題なかったでしょうか",
+    "何をしますか", "どうしますか", "どうされますか", "どうしましょう",
+    "いかがしますか", "いかがでしょうか", "いかがですか",
+    "よろしいですか", "よろしいでしょうか",
+    "次は何", "他に何か", "他にご要望", "他に対応", "ほかに",
+    "どれにしますか", "どれを", "どちらにしますか",
+    "お手伝いしましょうか", "お手伝いできること", "お手伝いします",
+    "何かありますか", "何かあれば",
+]
+# 「残作業なし」を明示する表現。発話のどこかにあれば最優先で完了とみなし除外する
+# （別セッションへの引き継ぎで「続き」等のやり残し語が紛れても、本セッションは完了のため）。
+_DONE_OVERRIDE_PHRASES = [
+    "特に作業はありません", "特にやることはありません", "特に対応は不要",
+    "残作業はありません", "やり残しはありません", "対応不要です",
+    "もう用済み", "このセッションは終了", "すべて完了しました", "全て完了しました",
+]
+# ねぎらい・追加提案で締める表現（作業完了後の「あれば言ってください」型）
+_CLOSING_COURTESY_PHRASES = [
+    "お知らせください", "ご連絡ください", "お申し付けください",
+    "必要であれば", "必要でしたら", "必要に応じて", "必要なら",
+    "あればお知らせ", "あれば教えて", "ご要望があれば",
+    "気軽に", "遠慮なく",
+]
+# ユーザー主導の中断マーカー（末尾にあれば「納得して停止」とみなし除外）
+_INTERRUPT_PREFIXES = ("[Request interrupted",)
+# 番号付きメニュー行（「1. …」「2) …」等）。AIが選択肢を提示して待機している状態の判定に使う。
+_MENU_LINE_RE = re.compile(r"^\s*\d+\s*[.\)、）:：]")
 # スキル/コマンド実行ログ（ノイズ）: 初回ユーザー発話がこれで始まるものは除外
 _NOISE_PREFIXES = [
     "# Observer Start", "# Instinct", "# Evolve", "# Usage Report",
@@ -588,6 +621,7 @@ _META_PREFIXES = (
     "<command-message>", "<command-name>", "<command-args>",
     "<local-command-",  # stdout / stderr / caveat をまとめて除外
     "<bash-", "<system-reminder>",
+    "<task-notification>",  # バックグラウンドタスク完了通知（ユーザー発話ではない）
     "Caveat: The messages below",
 )
 
@@ -632,6 +666,34 @@ def _last_line(text, maxlen=110):
     return ""
 
 
+def _is_interrupt(text):
+    """ユーザーがツール実行/応答を中断したマーカーか判定する。"""
+    return text.strip().startswith(_INTERRUPT_PREFIXES)
+
+
+def _has_menu(text):
+    """末尾AI発話が番号付きの選択肢メニュー（2項目以上）を含むか判定する。"""
+    return sum(1 for ln in text.split("\n") if _MENU_LINE_RE.match(ln)) >= 2
+
+
+def _leftover_hits(last_ai, skip_menu_lines):
+    """末尾AI発話から「やり残し表現」の一致を行単位で収集する。
+
+    skip_menu_lines=True のときは番号付きメニュー行（提示された選択肢）を無視する。
+    返り値: [(出現位置, 一致語, その行)] を出現位置順に並べたもの。
+    """
+    hits = []
+    for line in last_ai.split("\n"):
+        if skip_menu_lines and _MENU_LINE_RE.match(line):
+            continue
+        for w in _LEFTOVER_PHRASES:
+            pos = line.find(w)
+            if pos >= 0:
+                hits.append((pos, w, line.strip()))
+    hits.sort()
+    return hits
+
+
 def detect_incomplete(messages):
     """(role, text) 列から未完了シグナルをヒューリスティック抽出する（2層判定）。
 
@@ -670,20 +732,50 @@ def detect_incomplete(messages):
         if role == "assistant" and text.strip():
             last_ai = text
 
+    result = {
+        "last_ai": last_ai[-300:].strip(),
+        "intent": intent[:160],
+    }
+
+    # 末尾がユーザー主導の中断 → 「納得して自分で停止した」とみなし除外する。
+    # （AIの応答途中をユーザーが止めたケース。やり残しではなく満足終了として扱う）
+    if last_role == "user" and _is_interrupt(last_text):
+        return {**empty, **result}
+
+    # 「特に作業はありません」等、残作業なしを明言していれば最優先で完了扱い。
+    if any(p in last_ai for p in _DONE_OVERRIDE_PHRASES):
+        return {**empty, **result}
+
+    # 末尾AI発話の「完了／締め」シグナルを先に評価しておく。
+    # ・完了報告は末尾付近に限らず発話全体を見る（「完了です。- 〜」のように冒頭で報告し
+    #   箇条書きが続くと末尾窓から外れて取りこぼすため）。
+    completion_hit = next((p for p in _COMPLETION_PHRASES if p in last_ai), None)
+    closing_zone = last_ai.strip()[-150:]
+    is_closing_q = any(p in closing_zone for p in _CLOSING_QUESTION_PHRASES)
+    has_courtesy = any(p in closing_zone for p in _CLOSING_COURTESY_PHRASES)
+
+    tail = last_ai.strip()[-40:]
+    ends_q = last_role == "assistant" and (
+        tail.endswith(("?", "？")) or any(q in tail for q in _QUESTION_TAILS)
+    )
+    # AIが番号付きメニューを提示して「何をしますか?」と待機している＝次トピック待ちの待機状態。
+    is_idle_menu = ends_q and _has_menu(last_ai)
+
     signals = []
     evidence = []
     strength = 0
 
-    # 1) 末尾がユーザー発言（AIが応答せず終了）
+    # 1) 末尾がユーザー発言（AIが応答せず終了）。中断マーカーは上で除外済み。
     if last_role == "user" and last_text.strip():
         signals.append("AI未応答で終了")
         evidence.append({"label": "未応答のまま終了した発言", "text": _snippet_with(last_text, "")})
         strength += 3
 
-    # 2) やり残しを示唆する表現が末尾AI発話に含まれる
-    hit_pos = sorted((last_ai.find(w), w) for w in _LEFTOVER_PHRASES if w in last_ai)
-    if hit_pos:
-        hit_words = [w for _, w in hit_pos]
+    # 2) やり残しを示唆する表現が末尾AI発話に含まれる。
+    #    メニュー待機中は提示された選択肢（番号付き行）の語を拾わない（「2. 続きの調査」等）。
+    hits = _leftover_hits(last_ai, skip_menu_lines=is_idle_menu)
+    if hits:
+        hit_words = [w for _, w, _ in hits]
         signals.append("やり残し表現: " + ", ".join(sorted(set(hit_words))[:5]))
         evidence.append({"label": "一致した行", "text": _snippet_with(last_ai, hit_words[0])})
         strength += 2
@@ -694,31 +786,25 @@ def detect_incomplete(messages):
         evidence.append({"label": "未チェック項目", "text": _snippet_with(last_ai, "[ ]")})
         strength += 2
 
-    # 4) 質問・確認待ちで終了（弱シグナル）
-    tail = last_ai.strip()[-40:]
-    if last_role == "assistant" and any(q in tail for q in _QUESTION_TAILS):
+    # 4) 質問・確認待ちで終了（弱シグナル）。ただし以下は「満足終了」とみなし除外:
+    #    ・締めの確認質問（解決しましたか? 等）  ・メニュー待機  ・作業完了報告のあとの確認
+    if ends_q and not (is_closing_q or is_idle_menu or completion_hit):
         signals.append("確認/承認待ち")
         evidence.append({"label": "末尾の問いかけ", "text": _last_line(last_ai)})
         strength += 1
-
-    result = {
-        "last_ai": last_ai[-300:].strip(),
-        "intent": intent[:160],
-    }
 
     # ── strong: 明確なシグナルあり ──
     if signals:
         return {**result, "is_candidate": True, "tier": "strong",
                 "signals": signals, "evidence": evidence, "strength": strength}
 
-    # ── weak: シグナルは無いが「完了報告」も無い（＝言い切れていない） ──
-    # 完了報告で締めくくられていれば完了とみなして除外
-    done_tail = last_ai.strip()[-120:]
-    if any(p in done_tail for p in _COMPLETION_PHRASES):
-        return {**result, "is_candidate": False, "tier": "", "signals": [], "evidence": [], "strength": 0}
+    # ── weak: 明確なシグナルは無い候補。以下のいずれかで締めていれば完了とみなし除外 ──
+    #    ・完了報告  ・締めの確認質問  ・メニュー待機  ・ねぎらい/追加提案（必要なら〜）
+    if completion_hit or is_closing_q or is_idle_menu or has_courtesy:
+        return {**empty, **result}
     # 極端に短い問い（雑談・あいさつ・一問一答）は weak からも除外
     if len(intent.strip()) < 8:
-        return {**result, "is_candidate": False, "tier": "", "signals": [], "evidence": [], "strength": 0}
+        return {**empty, **result}
 
     return {**result, "is_candidate": True, "tier": "weak",
             "signals": ["完了報告なし"],
@@ -764,19 +850,32 @@ def incomplete_signature(candidates):
 
 
 def build_incomplete_triage_prompt(candidates):
-    """未完了候補を Claude に渡してトリアージ（分類・ノイズ除去）させるプロンプト。"""
+    """未完了候補を Claude に渡してトリアージ（分類・ノイズ除去）させるプロンプト。
+
+    出力は JSON 配列のみ。各要素はセッション番号(n)・分類(cat)・残作業(note)。
+    """
     lines = [
         "以下は Claude CLI のセッションのうち、未完了の疑いがあるものの一覧です。",
         "各セッションが本当に「やり残し」かを判断し、ノイズ（会話の自然な終了・",
         "質問への回答済み・既に完了）は除外してください。",
-        "残ったものを次の3カテゴリに分類し、優先度の高い順に日本語の箇条書きで出力してください。",
+        "残ったものを次の3カテゴリに分類してください。",
         "  A: 中断・保留中（再開待ち）",
         "  B: ほぼ完了・最終工程が残る（PR作成 / マージ / 実機確認 など）",
         "  C: 議論・調査のみで未着手",
-        "各行フォーマット: `[A] プロジェクト名: 内容（残作業）`",
-        "signals が「完了報告なし」のみの候補は確信度が低い。明確に完了済み・雑談・",
-        "回答済みなら遠慮なく除外してよい。",
-        "前置きや締めの文は不要。箇条書きのみ出力してください。",
+        "",
+        "【除外（配列に含めない）の判断基準】次のいずれかに当てはまれば「完了」とみなす:",
+        "  ・末尾AIが作業完了を報告している（できました / 完了 / マージ・コミット・プッシュ済み等）",
+        "  ・AIの回答や成果物提示でユーザーが納得し、自然に会話が終わっている",
+        "  ・末尾が締めの確認/提案質問（解決しましたか? / 何をしますか? / 必要ならお知らせください 等）",
+        "  ・AIが番号付きの選択肢メニューを出して次の指示を待っているだけ",
+        "  ・残作業は別セッションへ引き継ぎ済み、または「特に作業はありません」と明言",
+        "逆に A/B/C に残すのは、タスク続行の明確な承認待ち・実装/対応のやり残し・",
+        "外部待ち(blocked)・未対応のチェックリスト項目が実際に残っている場合に限る。",
+        "signals が「完了報告なし」のみの候補は確信度が低い。迷ったら除外してよい。",
+        "",
+        "出力は JSON 配列のみ。前置き・説明・コードフェンス(```)は一切付けないこと。",
+        '各要素の形式: {"n": セッション番号(整数), "cat": "A" | "B" | "C", "note": "残作業を簡潔に(日本語・60字以内)"}',
+        "優先度（やり残しの確度・重要度）の高い順に並べること。",
         "",
     ]
     for i, c in enumerate(candidates, 1):
@@ -789,6 +888,53 @@ def build_incomplete_triage_prompt(candidates):
         lines.append(f"  末尾AI: {last_ai[:300]}")
         lines.append("")
     return "\n".join(lines)
+
+
+def parse_triage_items(raw, candidates):
+    """モデルの JSON 出力を構造化アイテムへ変換する。
+
+    セッション番号(n)を candidates の index に対応付け、session_id 等を補完する。
+    パースに失敗したら None（呼び出し側でフリーテキストにフォールバック）。
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    # コードフェンスが付いた場合に備えて除去
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text).strip()
+    start = text.find("[")
+    end = text.rfind("]")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        arr = json.loads(text[start:end + 1])
+    except Exception:
+        return None
+    if not isinstance(arr, list):
+        return None
+    items = []
+    for obj in arr:
+        if not isinstance(obj, dict):
+            continue
+        try:
+            idx = int(obj.get("n")) - 1
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= len(candidates):
+            continue
+        c = candidates[idx]
+        cat = str(obj.get("cat", "")).strip().upper()
+        if cat not in ("A", "B", "C"):
+            cat = "C"
+        items.append({
+            "session_id":   c["session_id"],
+            "project":      c["project"],
+            "project_name": c["project_name"],
+            "category":     cat,
+            "note":         str(obj.get("note", "")).strip(),
+        })
+    return items
 
 
 def _print_incomplete_item(i, c):
@@ -956,6 +1102,25 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-inc-weak { margin-top: 16px; border-top: 1px dashed #2a2620; padding-top: 12px; }
   .ld-inc-weak > summary { cursor: pointer; color: #b9a87a; font-size: 11.5px; padding: 4px 0; user-select: none; }
   .ld-inc-weak > summary:hover { color: #fbbf24; }
+  .ld-inc-card { cursor: pointer; transition: border-color .12s; }
+  .ld-inc-card:hover { border-color: #7c5410; }
+  .ld-inc-card.ld-inc-active { border-color: #fbbf24; background: #1a1709; box-shadow: 0 0 0 1px rgba(251,191,36,0.35); }
+  .ld-triage-item.act { background: #2a2109; }
+  .ld-triage-item.act .ld-triage-note { color: #fff; }
+  .ld-inc-restale { font-size: 11.5px; color: #fbbf24; background: #221a06; border: 1px solid #3a2e0f; border-radius: 5px; padding: 8px 11px; margin-bottom: 10px; line-height: 1.6; }
+  .ld-inc-restale-list { margin-top: 5px; font-size: 10.5px; color: #b9a87a; font-family: 'JetBrains Mono', monospace; word-break: break-word; }
+  .ld-triage-list { display: flex; flex-direction: column; gap: 11px; }
+  .ld-triage-cat { font-size: 10.5px; color: #9a8b5e; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+  .ld-triage-cat.cat-A { color: #fbbf24; }
+  .ld-triage-cat.cat-B { color: #6ee7a8; }
+  .ld-triage-cat.cat-C { color: #93c5fd; }
+  .ld-triage-item { display: flex; gap: 9px; align-items: baseline; padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 12px; line-height: 1.5; }
+  .ld-triage-item:hover { background: #1f1709; }
+  .ld-triage-proj { flex-shrink: 0; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10.5px; color: #f0b35a; font-family: 'JetBrains Mono', monospace; }
+  .ld-triage-note { color: #d2d2d2; }
+  .ld-triage-item:hover .ld-triage-note { color: #fff; }
+  .ld-inc-flash { animation: incflash 1.2s ease; }
+  @keyframes incflash { 0% { border-color: #fbbf24; box-shadow: 0 0 0 2px rgba(251,191,36,0.4); } 100% { border-color: #1f1f23; box-shadow: none; } }
   .ld-inc-evidence { margin-top: 6px; font-size: 11px; color: #cbb88a; background: #16130b; border-left: 2px solid #7c5410; padding: 6px 10px; border-radius: 3px; line-height: 1.6; word-break: break-word; }
   .ld-inc-evidence .lbl { color: #7c6b3f; margin-right: 6px; }
   .ld-inc-cardsum { margin-top: 10px; padding: 8px 11px; background: #0d1a0d; border: 1px solid #1a3a1a; border-radius: 5px; }
@@ -1000,8 +1165,14 @@ const App = () => {
   const [cardSummaries, setCardSummaries] = React.useState({});
   const [cardSummaryLoading, setCardSummaryLoading] = React.useState({});
   const [cardSummaryError, setCardSummaryError] = React.useState({});
+  // 未完ビューのプロジェクト絞り込み
+  const [incFilterProject, setIncFilterProject] = React.useState('all');
+  // 前回トリアージ後に進行・追加されたセッション（再走査を促すため）
+  const [incStaleSessions, setIncStaleSessions] = React.useState([]);
+  // 内部リンクで選択中のセッション（カードを継続ハイライト）
+  const [incActiveSid, setIncActiveSid] = React.useState(null);
 
-  const INC_KEY = 'claude-resume:incomplete:v1';
+  const INC_KEY = 'claude-resume:incomplete:v2';
 
   React.useEffect(() => {
     fetch('/api/sessions?n=50')
@@ -1109,16 +1280,38 @@ const App = () => {
     } catch (e) { return null; }
   };
 
-  const saveIncompleteCache = (signature, triageText) => {
+  // キャッシュ署名(N|sid:ts|…)と現在の候補を突き合わせ、進行・追加されたセッションを返す
+  const diffStaleSessions = (oldSignature, currentCands) => {
+    const prev = {};
+    (oldSignature || '').split('|').slice(1).forEach(p => {
+      const idx = p.indexOf(':');
+      if (idx > 0) prev[p.slice(0, idx)] = p.slice(idx + 1);
+    });
+    return (currentCands || []).filter(c => {
+      const pt = prev[c.session_id];
+      return pt === undefined || String(pt) !== String(c.last_ts);
+    });
+  };
+
+  const saveIncompleteCache = (obj) => {
     try {
-      localStorage.setItem(INC_KEY, JSON.stringify({
-        signature, summary: triageText, generated_at: new Date().toISOString(),
-      }));
+      localStorage.setItem(INC_KEY, JSON.stringify(obj));
     } catch (e) {}
+  };
+
+  // トリアージ項目からカードへスクロール（内部リンク）。対象を継続ハイライトする。
+  const jumpToCard = (sid) => {
+    setIncActiveSid(sid);
+    const el = document.getElementById('inc-card-' + sid);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    el.classList.add('ld-inc-flash');
+    setTimeout(() => el.classList.remove('ld-inc-flash'), 1200);
   };
 
   const openIncomplete = async () => {
     setView('incomplete');
+    setIncFilterProject('all');
     clearSearch();
     setIncLoading(true);
     setIncTriage(null);
@@ -1138,13 +1331,19 @@ const App = () => {
         } catch (e) {}
       });
       setCardSummaries(sm);
-      // キャッシュ済みトリアージがあり署名一致なら即表示
+      // キャッシュ済みトリアージがあれば常に保持して表示する。
+      // 署名が一致しなくても破棄せず、進行・追加分を検出して再走査を促す。
       const cached = loadIncompleteCache();
       if (cached && cached.signature === data.signature) {
         setIncTriage(cached);
         setIncTriageStale(false);
+        setIncStaleSessions([]);
       } else if (cached) {
-        setIncTriageStale(true); // 候補集合が変化 → 再生成を促す
+        setIncTriage(cached);
+        setIncTriageStale(true);
+        setIncStaleSessions(diffStaleSessions(cached.signature, cands));
+      } else {
+        setIncStaleSessions([]);
       }
     } catch (e) { setIncCandidates([]); }
     setIncLoading(false);
@@ -1159,12 +1358,18 @@ const App = () => {
       const data = await res.json();
       if (data.error) {
         setIncTriageError(data.error);
-      } else if (data.summary !== undefined) {
-        const cached = { signature: data.signature, summary: data.summary, generated_at: new Date().toISOString() };
+      } else if (data.items !== undefined || data.summary !== undefined) {
+        const cached = {
+          signature: data.signature,
+          items: data.items || null,
+          summary: data.summary || '',
+          generated_at: new Date().toISOString(),
+        };
         setIncTriage(cached);
         setIncTriageStale(false);
+        setIncStaleSessions([]);
         setIncSignature(data.signature || '');
-        saveIncompleteCache(data.signature, data.summary);
+        saveIncompleteCache(cached);
       }
     } catch (e) { setIncTriageError('トリアージの取得に失敗しました: ' + e); }
     setIncTriageLoading(false);
@@ -1192,8 +1397,19 @@ const App = () => {
     const cmd = proj
       ? 'cd ' + proj + ' && claude --resume ' + c.session_id
       : 'claude --resume ' + c.session_id;
+    const stop = (e) => e.stopPropagation();
+    const openCard = () => openDetail({
+      session_id: c.session_id,
+      project: c.project,
+      project_name: c.project_name,
+      session_name: (c.intent || '').slice(0, 60) || '(未完了セッション)',
+      last_ts: c.last_ts,
+      messages: [],
+    });
     return (
-      <div key={c.session_id + i} className="ld-search-result">
+      <div key={c.session_id + i} id={'inc-card-' + c.session_id}
+           className={`ld-search-result ld-inc-card ${incActiveSid === c.session_id ? 'ld-inc-active' : ''}`}
+           onClick={openCard} title="クリックで詳細を表示">
         <span className="ld-proj" title={c.project}>{c.project_name}</span>
         <span className="ld-sr-time" style={{marginLeft:8}}>{relTime(c.last_ts)}</span>
         <span className="ld-inc-strength" title="未完了スコア">強度 {c.strength}</span>
@@ -1204,7 +1420,7 @@ const App = () => {
         {(c.evidence || []).filter(ev => ev.text).map((ev, j) => (
           <div key={j} className="ld-inc-evidence"><span className="lbl">{ev.label}:</span>{ev.text}</div>
         ))}
-        <div className="ld-sr-actions">
+        <div className="ld-sr-actions" onClick={stop}>
           <button className="ld-btn orange" onClick={() => launchTerminal(proj, c.session_id)}>ターミナルで開く</button>
           <div className="ld-cmd-row">
             <span className="ld-cmd-text">{cmd}</span>
@@ -1212,7 +1428,7 @@ const App = () => {
           </div>
         </div>
         {cardSummaries[c.session_id] ? (
-          <div className="ld-inc-cardsum">
+          <div className="ld-inc-cardsum" onClick={stop}>
             <div className="ld-inc-cardsum-head">
               <span>⚡ AI 要約</span>
               <button className="ld-btn" style={{height:'18px', fontSize:'9.5px', padding:'0 6px'}}
@@ -1222,14 +1438,14 @@ const App = () => {
             <div className="ld-inc-cardsum-text">{cardSummaries[c.session_id]}</div>
           </div>
         ) : (
-          <>
+          <div onClick={stop}>
             <button className="ld-btn" style={{marginTop:8, fontSize:'10.5px'}}
                     disabled={cardSummaryLoading[c.session_id]}
                     onClick={() => generateSummaryForCard(c.session_id)}>
               {cardSummaryLoading[c.session_id] ? '要約生成中…' : (cardSummaryError[c.session_id] ? '⚡ 再試行' : '⚡ このセッションを要約')}
             </button>
             {cardSummaryError[c.session_id] && <div className="ld-inc-error" style={{marginTop:6}}>⚠ {cardSummaryError[c.session_id]}</div>}
-          </>
+          </div>
         )}
       </div>
     );
@@ -1277,6 +1493,13 @@ const App = () => {
   }), [sessions, filterProject, filterTime]);
 
   const projects = React.useMemo(() => [...new Set(sessions.map(s => s.project_name))], [sessions]);
+
+  // 未完候補のプロジェクト別件数（多い順）
+  const incProjects = React.useMemo(() => {
+    const counts = {};
+    (incCandidates || []).forEach(c => { counts[c.project_name] = (counts[c.project_name] || 0) + 1; });
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  }, [incCandidates]);
 
   const relTime = (ts) => {
     const d = now - ts;
@@ -1374,6 +1597,23 @@ const App = () => {
 
       <div className="ld-main">
         {view === 'incomplete' ? (
+          <>
+          <div className="ld-side">
+            <div className="grp">Projects</div>
+            <div className={`item ${incFilterProject==='all' ? 'act' : ''}`}
+                 onClick={() => setIncFilterProject('all')}>
+              <span>すべて</span>
+              <span className="count">{(incCandidates || []).length}</span>
+            </div>
+            {incProjects.map(([name, n]) => (
+              <div key={name}
+                   className={`item ${incFilterProject===name ? 'act' : ''}`}
+                   onClick={() => setIncFilterProject(name)}>
+                <span style={{overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap'}}>{name}</span>
+                <span className="count">{n}</span>
+              </div>
+            ))}
+          </div>
           <div className="ld-list">
             <div className="ld-sr-container">
               <div className="ld-inc-intro">
@@ -1394,14 +1634,61 @@ const App = () => {
                   <div style={{color:'#4a6a4a', fontSize:'12px'}}>分類を生成中…（数十秒かかることがあります）</div>
                 ) : incTriage ? (
                   <>
-                    <div className="ld-summary-text">{incTriage.summary || '（該当なし）'}</div>
+                    {incTriageStale && (
+                      <div className="ld-inc-restale">
+                        ⟳ 前回トリアージ後に {incStaleSessions.length} 件のセッションが進行・追加されています。
+                        最新の状況を反映するには再走査（再生成）してください。
+                        {incStaleSessions.length > 0 && (
+                          <div className="ld-inc-restale-list">
+                            {[...new Set(incStaleSessions.map(c => c.project_name))].slice(0, 6).join(' / ')}
+                            {new Set(incStaleSessions.map(c => c.project_name)).size > 6 ? ' …' : ''}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {(() => {
+                      // 構造化失敗時は旧フリーテキストにフォールバック
+                      if (!incTriage.items) {
+                        return <div className="ld-summary-text">{incTriage.summary || '（該当なし）'}</div>;
+                      }
+                      if (incTriage.items.length === 0) {
+                        return <div className="ld-summary-text">やり残しは検出されませんでした 🎉</div>;
+                      }
+                      const items = incTriage.items.filter(it => incFilterProject === 'all' || it.project_name === incFilterProject);
+                      if (items.length === 0) {
+                        return <div className="ld-summary-text">このプロジェクトに該当するやり残しはありません</div>;
+                      }
+                      const cats = [['A', '中断・保留中'], ['B', '最終工程が残る'], ['C', '未着手']];
+                      return (
+                        <div className="ld-triage-list">
+                          {cats.map(([cat, label]) => {
+                            const group = items.filter(it => it.category === cat);
+                            if (group.length === 0) return null;
+                            return (
+                              <div key={cat} className="ld-triage-group">
+                                <div className={`ld-triage-cat cat-${cat}`}>{cat}: {label}（{group.length}）</div>
+                                {group.map((it, j) => (
+                                  <a key={it.session_id + j}
+                                     className={`ld-triage-item ${incActiveSid === it.session_id ? 'act' : ''}`}
+                                     title="クリックで下のカードへ移動"
+                                     onClick={() => jumpToCard(it.session_id)}>
+                                    <span className="ld-triage-proj">{it.project_name}</span>
+                                    <span className="ld-triage-note">{it.note || '(内容不明)'}</span>
+                                  </a>
+                                ))}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      );
+                    })()}
                     <div className="ld-summary-footer">
                       <span className="ld-summary-time">
                         {incTriage.generated_at ? new Date(incTriage.generated_at).toLocaleString('ja-JP', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}) + ' 生成' : ''}
                       </span>
-                      {incTriageStale && <span className="ld-summary-stale">候補が変化しています</span>}
+                      {incTriageStale && <span className="ld-summary-stale">要再走査</span>}
                       <button className="ld-btn" style={{height:'20px', fontSize:'10px', padding:'0 7px'}}
-                              onClick={generateTriage}>再生成</button>
+                              onClick={generateTriage}>再走査</button>
                     </div>
                   </>
                 ) : (
@@ -1421,31 +1708,27 @@ const App = () => {
                 if (incLoading) {
                   return <><div className="ld-sr-header">スキャン中…</div><div className="ld-loading">セッションを走査中…</div></>;
                 }
-                const cands = incCandidates || [];
-                if (cands.length === 0) {
+                const all = incCandidates || [];
+                if (all.length === 0) {
                   return <div className="ld-loading">未完了の候補は見つかりませんでした 🎉</div>;
                 }
-                const strong = cands.filter(c => c.tier === 'strong');
-                const weak = cands.filter(c => c.tier === 'weak');
+                const cands = all.filter(c => incFilterProject === 'all' || c.project_name === incFilterProject);
+                if (cands.length === 0) {
+                  return <div className="ld-loading">このプロジェクトに未完了の候補はありません</div>;
+                }
+                // 優先度（strength→新しさ）順に全件表示
                 return (
                   <>
                     <div className="ld-sr-header">
-                      未完了のシグナルあり: {strong.length}件{weak.length ? `（ほか 完了報告のない作業 ${weak.length}件）` : ''}
+                      未完了の候補: {cands.length}件{incFilterProject !== 'all' ? `（${incFilterProject}）` : ''}・優先度順
                     </div>
-                    {strong.map((c, i) => renderIncCard(c, i))}
-                    {weak.length > 0 && (
-                      <details className="ld-inc-weak">
-                        <summary>完了報告のない作業をさらに表示（{weak.length}件・要確認）</summary>
-                        <div style={{marginTop:10}}>
-                          {weak.map((c, i) => renderIncCard(c, 'w' + i))}
-                        </div>
-                      </details>
-                    )}
+                    {cands.map((c, i) => renderIncCard(c, i))}
                   </>
                 );
               })()}
             </div>
           </div>
+          </>
         ) : (
         <>
         <div className="ld-side">
@@ -1796,8 +2079,10 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
                     ensure_ascii=False).encode('utf-8'))
                 return
 
+            # 構造化（内部リンク・プロジェクト絞り込み用）。失敗時はフリーテキストにフォールバック。
+            items = parse_triage_items(summary, candidates)
             self.wfile.write(json.dumps(
-                {"summary": summary, "signature": signature, "count": len(candidates)},
+                {"items": items, "summary": summary, "signature": signature, "count": len(candidates)},
                 ensure_ascii=False).encode('utf-8'))
 
         elif parsed.path == '/api/summary':
