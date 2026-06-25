@@ -355,6 +355,109 @@ def load_session_messages(session_id, target_dirs):
     return []
 
 
+def _stringify_tool_input(name, tool_input):
+    """tool_use の入力を表示用の短い文字列にする。Bash はコマンドをそのまま出す。"""
+    if not isinstance(tool_input, dict):
+        return str(tool_input)
+    # よく使うツールは代表的なキーを優先的に表示
+    for key in ("command", "file_path", "path", "pattern", "query", "url"):
+        if key in tool_input and isinstance(tool_input[key], str):
+            return tool_input[key]
+    try:
+        return json.dumps(tool_input, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(tool_input)
+
+
+def _stringify_tool_result(content):
+    """tool_result の content（str または block 配列）を表示用テキストにする。"""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict):
+                if b.get("type") == "text":
+                    parts.append(b.get("text", ""))
+                elif b.get("type") == "image":
+                    parts.append("[image]")
+            elif isinstance(b, str):
+                parts.append(b)
+        return "\n".join(parts).strip()
+    return str(content).strip()
+
+
+def load_session_detail(session_id, target_dirs):
+    """セッションを時系列の表示項目リストで返す（モーダル詳細表示用）。
+
+    各項目は {"kind": ..., "text": ...} の dict。
+      kind: 'user' | 'assistant' | 'thinking' | 'tool_use' | 'tool_result'
+      tool_use は追加で "name"、tool_result は "is_error" を持つ。
+    text-only の load_session_messages とは別物（要約・未完検出には使わない）。
+    """
+    for base_dir in target_dirs:
+        projects_dir = base_dir / "projects"
+        if not projects_dir.exists():
+            continue
+        for project_dir in projects_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            jsonl_file = project_dir / f"{session_id}.jsonl"
+            if not jsonl_file.exists():
+                continue
+            items = []
+            try:
+                with open(jsonl_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        msg = entry.get('message', {})
+                        if not msg:
+                            continue
+                        role = msg.get('role')
+                        if role not in ('user', 'assistant'):
+                            continue
+                        content = msg.get('content', '')
+                        if not isinstance(content, list):
+                            text = str(content).strip()
+                            if text:
+                                items.append({"kind": role, "text": text})
+                            continue
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            btype = block.get('type')
+                            if btype == 'text':
+                                text = (block.get('text') or '').strip()
+                                if text:
+                                    items.append({"kind": role, "text": text})
+                            elif btype == 'thinking':
+                                text = (block.get('thinking') or block.get('text') or '').strip()
+                                if text:
+                                    items.append({"kind": "thinking", "text": text})
+                            elif btype == 'tool_use':
+                                name = block.get('name', 'tool')
+                                text = _stringify_tool_input(name, block.get('input'))
+                                items.append({"kind": "tool_use", "name": name, "text": text})
+                            elif btype == 'tool_result':
+                                text = _stringify_tool_result(block.get('content', ''))
+                                if text:
+                                    items.append({
+                                        "kind": "tool_result",
+                                        "text": text,
+                                        "is_error": bool(block.get('is_error')),
+                                    })
+            except (OSError, UnicodeDecodeError):
+                pass
+            return items
+    return []
+
+
 def format_timestamp(ts_ms):
     dt = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).astimezone(JST)
     return dt.strftime("%m/%d %H:%M")
@@ -812,19 +915,75 @@ def detect_incomplete(messages):
             "strength": 0}
 
 
+DONE_FILE = Path.home() / ".claude-resume-done.json"
+
+
+def load_done_map():
+    """手動で「完了」にしたセッションの {session_id: last_ts} を返す。"""
+    try:
+        with open(DONE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        done = data.get("done", {})
+        return done if isinstance(done, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_done_entry(session_id, last_ts):
+    """セッションを「完了」として記録する（その時点の last_ts を保存）。"""
+    done = load_done_map()
+    try:
+        done[session_id] = int(last_ts)
+    except (TypeError, ValueError):
+        done[session_id] = last_ts
+    try:
+        with open(DONE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"done": done}, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def remove_done_entry(session_id):
+    """セッションの「完了」記録を解除する。"""
+    done = load_done_map()
+    if session_id in done:
+        del done[session_id]
+        try:
+            with open(DONE_FILE, 'w', encoding='utf-8') as f:
+                json.dump({"done": done}, f, ensure_ascii=False, indent=2)
+        except OSError:
+            return False
+    return True
+
+
+def _is_marked_done(done_map, session_id, last_ts):
+    """完了記録済みかつ記録後に新たな進行が無ければ True（=未完候補から除外）。"""
+    if session_id not in done_map:
+        return False
+    try:
+        return int(done_map[session_id]) >= int(last_ts)
+    except (TypeError, ValueError):
+        return True
+
+
 def scan_incomplete_sessions(limit=200, strict=False, debug=False):
     """全セッションを走査し、未完了候補を優先度（strength→新しさ）順で返す。
 
     strict=True のときは tier="strong"（明確なシグナル有）のみを返す。
     strict=False（既定）は weak（完了報告が無いだけ）も含めた高リコール。
+    手動で「完了」にしたセッションは、その後に新たな進行が無ければ除外する。
     """
     sessions = load_recent_sessions(limit, debug=debug)
+    done_map = load_done_map()
     candidates = []
     for sess in sessions:
         info = detect_incomplete(sess.get("messages", []))
         if not info["is_candidate"]:
             continue
         if strict and info["tier"] != "strong":
+            continue
+        if _is_marked_done(done_map, sess["session_id"], sess["last_ts"]):
             continue
         candidates.append({
             "session_id":   sess["session_id"],
@@ -1070,6 +1229,21 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-msg-assistant .ld-msg-body { border-left-color: #f97316; }
   .ld-msg-assistant { margin-top: 8px; }
 
+  /* ツール実行・思考・結果ブロック */
+  .ld-item-pre { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height: 1.55; color: #c8c8cc; white-space: pre-wrap; word-break: break-word; padding: 8px 11px; background: #0f0f12; border-radius: 5px; }
+  .ld-item-scroll { max-height: 260px; overflow-y: auto; }
+  .ld-item-tool { border-left: 2px solid #38bdf8; padding-left: 0; }
+  .ld-item-tool-head { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 600; color: #38bdf8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; padding-left: 4px; }
+  .ld-item-tool .ld-item-pre { border-left: 2px solid #1a3a4a; }
+  .ld-item-result { border-left: 2px solid #2dd4bf; }
+  .ld-item-result-head { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 600; color: #2dd4bf; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; padding-left: 4px; }
+  .ld-item-result.err .ld-item-result-head { color: #f87171; }
+  .ld-item-result.err .ld-item-pre { background: #1a0e0e; }
+  .ld-item-think { background: #131316; border-radius: 5px; border-left: 2px solid #555; }
+  .ld-item-think > summary { cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; color: #888; padding: 7px 11px; user-select: none; letter-spacing: 0.04em; }
+  .ld-item-think > summary:hover { color: #aaa; }
+  .ld-item-think .ld-item-pre { background: transparent; color: #9a9aa0; font-style: italic; }
+
   .ld-summary-panel { margin: 10px 18px 0; padding: 10px 14px; background: #0d1a0d; border: 1px solid #1a3a1a; border-radius: 6px; }
   .ld-summary-header { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 10.5px; color: #22c55e; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; letter-spacing: 0.06em; }
   .ld-summary-text { font-size: 12.5px; color: #c9f7c9; line-height: 1.7; white-space: pre-wrap; }
@@ -1092,6 +1266,8 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-btn.orange:hover { background: #ea580c; border-color: #ea580c; }
   .ld-btn.warn { border-color: #7c5410; color: #fbbf24; }
   .ld-btn.warn:hover { background: #1f1709; border-color: #b8860b; }
+  .ld-btn.done { border-color: #1a6a3a; color: #4ade80; }
+  .ld-btn.done:hover { background: #0d2a18; border-color: #22c55e; }
 
   .ld-inc-intro { background: #1a1709; border: 1px solid #3a2e0f; border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; }
   .ld-inc-intro-title { font-size: 13px; color: #fbbf24; font-weight: 600; margin-bottom: 6px; }
@@ -1146,6 +1322,7 @@ const App = () => {
   const [filterTime, setFilterTime] = React.useState('all');
   const [openSession, setOpenSession] = React.useState(null);
   const [modalMessages, setModalMessages] = React.useState(null);
+  const [modalItems, setModalItems] = React.useState(null);
   const [loadingModal, setLoadingModal] = React.useState(false);
   const [summary, setSummary] = React.useState(null);
   const [summaryLoading, setSummaryLoading] = React.useState(false);
@@ -1240,6 +1417,7 @@ const App = () => {
     setOpenSession(s);
     setLoadingModal(true);
     setModalMessages(null);
+    setModalItems(null);
     setSummary(null);
     setSummaryStale(false);
     try {
@@ -1247,6 +1425,7 @@ const App = () => {
       const data = await res.json();
       const msgs = data.messages || [];
       setModalMessages(msgs);
+      setModalItems(data.items || []);
       // キャッシュ確認
       const cached = loadCachedSummary(s.session_id, msgs.length);
       if (cached) {
@@ -1392,6 +1571,23 @@ const App = () => {
     setCardSummaryLoading(prev => ({ ...prev, [sid]: false }));
   };
 
+  // 未完候補を「完了」にする（サーバーに記録し、一覧から除外）
+  const markIncDone = async (c) => {
+    try {
+      await fetch('/api/incomplete/done?session_id=' + encodeURIComponent(c.session_id)
+        + '&last_ts=' + encodeURIComponent(c.last_ts || 0));
+    } catch (e) {}
+    setIncCandidates(prev => (prev || []).filter(x => x.session_id !== c.session_id));
+    if (incActiveSid === c.session_id) setIncActiveSid(null);
+    // AIトリアージ結果からも除外し、localStorage キャッシュも更新する
+    setIncTriage(prev => {
+      if (!prev || !Array.isArray(prev.items)) return prev;
+      const next = { ...prev, items: prev.items.filter(it => it.session_id !== c.session_id) };
+      saveIncompleteCache(next);
+      return next;
+    });
+  };
+
   const renderIncCard = (c, i) => {
     const proj = c.project && c.project !== '(Global/No Directory)' ? c.project : '';
     const cmd = proj
@@ -1421,6 +1617,8 @@ const App = () => {
           <div key={j} className="ld-inc-evidence"><span className="lbl">{ev.label}:</span>{ev.text}</div>
         ))}
         <div className="ld-sr-actions" onClick={stop}>
+          <button className="ld-btn done" title="このセッションを完了にして未完一覧から除外します"
+                  onClick={() => markIncDone(c)}>✓ 完了にする</button>
           <button className="ld-btn orange" onClick={() => launchTerminal(proj, c.session_id)}>ターミナルで開く</button>
           <div className="ld-cmd-row">
             <span className="ld-cmd-text">{cmd}</span>
@@ -1449,6 +1647,51 @@ const App = () => {
         )}
       </div>
     );
+  };
+
+  // モーダル詳細: 時系列の項目（テキスト/思考/コマンド/結果）を1件描画
+  const renderModalItem = (it, i) => {
+    if (it.kind === 'user') {
+      return (
+        <div key={i} className="ld-msg ld-msg-user">
+          <div className="ld-msg-head"><span className="ld-msg-role">you</span></div>
+          <div className="ld-msg-body">{it.text}</div>
+        </div>
+      );
+    }
+    if (it.kind === 'assistant') {
+      return (
+        <div key={i} className="ld-msg ld-msg-assistant">
+          <div className="ld-msg-head"><span className="ld-msg-role">claude</span></div>
+          <div className="ld-msg-body">{it.text}</div>
+        </div>
+      );
+    }
+    if (it.kind === 'thinking') {
+      return (
+        <details key={i} className="ld-item-think">
+          <summary>💭 思考プロセス</summary>
+          <div className="ld-item-pre">{it.text}</div>
+        </details>
+      );
+    }
+    if (it.kind === 'tool_use') {
+      return (
+        <div key={i} className="ld-item-tool">
+          <div className="ld-item-tool-head">⚙ {it.name}</div>
+          <div className="ld-item-pre">{it.text}</div>
+        </div>
+      );
+    }
+    if (it.kind === 'tool_result') {
+      return (
+        <div key={i} className={'ld-item-result' + (it.is_error ? ' err' : '')}>
+          <div className="ld-item-result-head">{it.is_error ? '✕ 実行結果（エラー）' : '↳ 実行結果'}</div>
+          <div className="ld-item-pre ld-item-scroll">{it.text}</div>
+        </div>
+      );
+    }
+    return null;
   };
 
   // 検索結果からモーダルを開く
@@ -1519,19 +1762,6 @@ const App = () => {
       if (role === 'user') return text.replace(/\s+/g, ' ').slice(0, 70);
     }
     return '';
-  };
-
-  const groupTurns = (msgs) => {
-    const turns = [];
-    let i = 0;
-    while (i < msgs.length) {
-      if (msgs[i][0] === 'user') {
-        const ai = (i + 1 < msgs.length && msgs[i+1][0] === 'assistant') ? msgs[i+1] : null;
-        turns.push([msgs[i], ai]);
-        i += ai ? 2 : 1;
-      } else i++;
-    }
-    return turns;
   };
 
   React.useEffect(() => {
@@ -1844,6 +2074,10 @@ const App = () => {
                   {new Date(openSession.last_ts).toLocaleString('ja-JP', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'})}
                 </span>
                 <span style={{marginLeft:'auto', display:'flex', gap:6}}>
+                  <button className="ld-btn done" title="このセッションを完了にして未完一覧から除外します"
+                          onClick={() => { markIncDone(openSession); setOpenSession(null); }}>
+                    ✓ 完了にする
+                  </button>
                   <button className="ld-btn orange"
                           onClick={() => launchTerminal(openSession.project, openSession.session_id)}>
                     ターミナルで開く
@@ -1901,28 +2135,19 @@ const App = () => {
             <div className="ld-transcript">
               {loadingModal
                 ? <div className="ld-loading">読み込み中…</div>
-                : modalMessages && modalMessages.length > 0
-                  ? groupTurns(modalMessages).map(([um, am], i) => (
-                    <div key={i}>
-                      <div className="ld-turn-num">── Turn {i+1} ──</div>
-                      {um && (
-                        <div className="ld-msg ld-msg-user">
-                          <div className="ld-msg-head">
-                            <span className="ld-msg-role">you</span>
-                          </div>
-                          <div className="ld-msg-body">{um[1]}</div>
-                        </div>
-                      )}
-                      {am && (
-                        <div className="ld-msg ld-msg-assistant">
-                          <div className="ld-msg-head">
-                            <span className="ld-msg-role">claude</span>
-                          </div>
-                          <div className="ld-msg-body">{am[1]}</div>
-                        </div>
-                      )}
-                    </div>
-                  ))
+                : modalItems && modalItems.length > 0
+                  ? (() => {
+                      let turn = 0;
+                      const out = [];
+                      modalItems.forEach((it, i) => {
+                        if (it.kind === 'user') {
+                          turn += 1;
+                          out.push(<div key={'turn' + i} className="ld-turn-num">── Turn {turn} ──</div>);
+                        }
+                        out.push(renderModalItem(it, i));
+                      });
+                      return out;
+                    })()
                   : <div className="ld-loading">メッセージがありません</div>
               }
             </div>
@@ -2024,18 +2249,42 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             else:
                 self.wfile.write(json.dumps({"ok": False, "error": "session_id required"}).encode('utf-8'))
 
+        elif parsed.path == '/api/incomplete/done':
+            # 未完候補を手動で「完了」にする / 解除する
+            query = parse_qs(parsed.query)
+            session_id = query.get('session_id', [''])[0]
+            undo = query.get('undo', ['0'])[0] in ('1', 'true')
+            last_ts = query.get('last_ts', ['0'])[0]
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.end_headers()
+
+            if not session_id:
+                self.wfile.write(json.dumps({"ok": False, "error": "session_id required"}).encode('utf-8'))
+            elif undo:
+                ok = remove_done_entry(session_id)
+                self.wfile.write(json.dumps({"ok": ok}).encode('utf-8'))
+            else:
+                ok = save_done_entry(session_id, last_ts)
+                self.wfile.write(json.dumps({"ok": ok}).encode('utf-8'))
+
         elif parsed.path.startswith('/api/session/'):
             # セッションIDを抽出
             session_id = parsed.path.split('/api/session/')[1]
             messages = load_session_messages(session_id, self.target_dirs)
+            # リッチ表示用（コマンド・実行結果・thinking を含む時系列項目）
+            items = load_session_detail(session_id, self.target_dirs)
 
-            # tuple を list に変換
+            # tuple を list に変換（要約キャッシュの message_count 整合のため text-only を維持）
             messages_json = [[role, text] for role, text in messages]
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json; charset=utf-8')
             self.end_headers()
-            self.wfile.write(json.dumps({"messages": messages_json}, ensure_ascii=False).encode('utf-8'))
+            self.wfile.write(json.dumps(
+                {"messages": messages_json, "items": items},
+                ensure_ascii=False).encode('utf-8'))
 
         elif parsed.path == '/api/incomplete':
             # 全セッションを走査して未完了候補を返す（ヒューリスティック・軽量）
