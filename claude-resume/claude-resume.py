@@ -661,6 +661,12 @@ _LEFTOVER_PHRASES = [
     # 次工程・積み残しを示す表現（「〇〇完了。次は△△」型の取りこぼし対策）
     "次のステップ", "次のフェーズ", "次セッション", "未処理",
 ]
+# 上記のうち、完了報告と同時に現れると誤検出になりやすい「依頼/確認」系の語。
+# 末尾AI発話に完了報告があるときは、これらだけをやり残しシグナルから除外する
+# （例:「修正が完了しました。動作確認をお願いします。」を未完としない）。
+# 一方「未実装 / 次は」等の実質的なやり残し語やチェックリストは完了報告があっても残す
+# （README の「PR作成。次は△△ は候補に残す」方針）。
+_COURTESY_LEFTOVER_PHRASES = {"お願いします", "確認してください"}
 # 質問・確認待ちで終わる語尾（弱シグナル）
 _QUESTION_TAILS = [
     "?", "？", "ますか", "でしょうか", "どちら", "よろしい",
@@ -877,6 +883,11 @@ def detect_incomplete(messages):
     # 2) やり残しを示唆する表現が末尾AI発話に含まれる。
     #    メニュー待機中は提示された選択肢（番号付き行）の語を拾わない（「2. 続きの調査」等）。
     hits = _leftover_hits(last_ai, skip_menu_lines=is_idle_menu)
+    # 完了報告があるときは「依頼/確認」系の語（お願いします 等）を数えない。
+    # 完了直後の「動作確認をお願いします」等を未完と誤検出しないための抑制。
+    # 未実装・次は 等の実質的なやり残し語は残す（完了＋積み残しは候補に残す方針）。
+    if completion_hit:
+        hits = [h for h in hits if h[1] not in _COURTESY_LEFTOVER_PHRASES]
     if hits:
         hit_words = [w for _, w, _ in hits]
         signals.append("やり残し表現: " + ", ".join(sorted(set(hit_words))[:5]))
@@ -2173,6 +2184,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);
 """
 
 
+# セッションIDの許容文字（英数・ハイフン・アンダースコア）。クエリ由来の値を
+# シェルスクリプトやパスに使う前に検証し、コマンド注入・パストラバーサルを防ぐ。
+_SESSION_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
+
+
 class ClaudeResumeHandler(BaseHTTPRequestHandler):
     count = 10
     debug = False
@@ -2223,14 +2239,14 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json; charset=utf-8')
             self.end_headers()
 
-            if session_id:
+            if session_id and _SESSION_ID_RE.match(session_id):
                 try:
                     script_path = f'/tmp/cr_{session_id[:8]}.sh'
                     lines = ['#!/bin/zsh', 'source ~/.zshrc 2>/dev/null']
                     if project:
                         lines.append(f'cd {shlex.quote(project)}')
                     lines.append(f'rm -f {shlex.quote(script_path)}')
-                    lines.append(f'claude --resume {session_id}')
+                    lines.append(f'claude --resume {shlex.quote(session_id)}')
                     lines.append('exec zsh')
 
                     with open(script_path, 'w') as f:
@@ -2247,7 +2263,8 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode('utf-8'))
             else:
-                self.wfile.write(json.dumps({"ok": False, "error": "session_id required"}).encode('utf-8'))
+                err = "session_id required" if not session_id else "invalid session_id"
+                self.wfile.write(json.dumps({"ok": False, "error": err}).encode('utf-8'))
 
         elif parsed.path == '/api/incomplete/done':
             # 未完候補を手動で「完了」にする / 解除する
