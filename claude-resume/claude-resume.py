@@ -5,7 +5,9 @@ import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
+import time
 import webbrowser
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -1275,6 +1277,8 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-cmd-text { flex: 1; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #93c5fd; overflow-x: auto; white-space: nowrap; }
   .ld-btn.orange { background: #c2410c; border-color: #c2410c; color: #fff; }
   .ld-btn.orange:hover { background: #ea580c; border-color: #ea580c; }
+  .ld-btn.herdr { background: #0d7377; border-color: #0d7377; color: #fff; }
+  .ld-btn.herdr:hover { background: #14a2a8; border-color: #14a2a8; }
   .ld-btn.warn { border-color: #7c5410; color: #fbbf24; }
   .ld-btn.warn:hover { background: #1f1709; border-color: #b8860b; }
   .ld-btn.done { border-color: #1a6a3a; color: #4ade80; }
@@ -1631,6 +1635,7 @@ const App = () => {
           <button className="ld-btn done" title="このセッションを完了にして未完一覧から除外します"
                   onClick={() => markIncDone(c)}>✓ 完了にする</button>
           <button className="ld-btn orange" onClick={() => launchTerminal(proj, c.session_id)}>ターミナルで開く</button>
+          <button className="ld-btn herdr" onClick={() => launchHerdr(proj, c.session_id)}>Herdrで開く</button>
           <div className="ld-cmd-row">
             <span className="ld-cmd-text">{cmd}</span>
             <button className="ld-btn" onClick={() => copyToClipboard(cmd)}>コピー</button>
@@ -1722,6 +1727,18 @@ const App = () => {
   const launchTerminal = (project, sessionId) => {
     const p = new URLSearchParams({ project, session_id: sessionId });
     fetch('/api/launch?' + p);
+  };
+
+  const launchHerdr = (project, sessionId) => {
+    const p = new URLSearchParams({ project, session_id: sessionId });
+    fetch('/api/launch-herdr?' + p)
+      .then((res) => res.json())
+      .then((data) => {
+        if (!data.ok) {
+          alert('Herdrで開けませんでした: ' + (data.error || '不明なエラー'));
+        }
+      })
+      .catch((e) => alert('Herdrで開けませんでした: ' + e));
   };
 
   const copyToClipboard = (text) => {
@@ -2021,6 +2038,7 @@ const App = () => {
                       <div className="ld-sr-actions">
                         <button className="ld-btn primary" onClick={() => openDetailFromSearch(r)}>全文表示</button>
                         <button className="ld-btn orange" onClick={() => launchTerminal(proj, r.session_id)}>ターミナルで開く</button>
+                        <button className="ld-btn herdr" onClick={() => launchHerdr(proj, r.session_id)}>Herdrで開く</button>
                         <div className="ld-cmd-row">
                           <span className="ld-cmd-text">{cmd}</span>
                           <button className="ld-btn" onClick={() => copyToClipboard(cmd)}>コピー</button>
@@ -2092,6 +2110,10 @@ const App = () => {
                   <button className="ld-btn orange"
                           onClick={() => launchTerminal(openSession.project, openSession.session_id)}>
                     ターミナルで開く
+                  </button>
+                  <button className="ld-btn herdr"
+                          onClick={() => launchHerdr(openSession.project, openSession.session_id)}>
+                    Herdrで開く
                   </button>
                   <button className="ld-btn" onClick={() => setOpenSession(null)}>✕</button>
                 </span>
@@ -2188,6 +2210,187 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);
 # シェルスクリプトやパスに使う前に検証し、コマンド注入・パストラバーサルを防ぐ。
 _SESSION_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,128}$')
 
+# Herdr のペインID形式（例: wB:p1, w5:pD）。ワークスペース/ペイン番号は英数字
+# （base36的）を含むため \d ではなく英数字で拾う。戻り値の構造が変わった場合の保険。
+_HERDR_PANE_RE = re.compile(r'"(w[0-9A-Za-z]+:p[0-9A-Za-z]+)"')
+
+
+def _herdr_socket_path():
+    """Herdr の Unix ソケットパスを解決する。
+
+    優先順位は Socket API ドキュメントに合わせる:
+    HERDR_SOCKET_PATH > HERDR_SESSION > 既定 (~/.config/herdr/herdr.sock)。
+    """
+    explicit = os.environ.get('HERDR_SOCKET_PATH')
+    if explicit:
+        return explicit
+    base = Path.home() / '.config' / 'herdr'
+    session = os.environ.get('HERDR_SESSION')
+    if session:
+        return str(base / 'sessions' / session / 'herdr.sock')
+    return str(base / 'herdr.sock')
+
+
+def _herdr_ui_running():
+    """Herdr の UI クライアントが起動しているかを /proc から判定する。
+
+    Herdr はサーバ（デーモン）と UI クライアントが分離しており、サーバだけ
+    動いていると workspace は作れても画面には出ない。`herdr server`（ヘッドレス
+    サーバ）以外の `herdr` プロセスがあれば UI クライアントが起動していると見なす。
+    """
+    try:
+        pids = [d for d in os.listdir('/proc') if d.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                parts = [x for x in f.read().split(b'\x00') if x]
+        except OSError:
+            continue
+        if not parts:
+            continue
+        exe = os.path.basename(parts[0].decode('utf-8', 'replace'))
+        if exe != 'herdr':
+            continue
+        args = [p.decode('utf-8', 'replace') for p in parts[1:]]
+        if args and args[0] == 'server':
+            continue  # ヘッドレスサーバ本体。UI クライアントではない。
+        return True
+    return False
+
+
+def _spawn_herdr_ui():
+    """Herdr の UI クライアントを Windows Terminal の新規タブで起動する。
+
+    「ターミナルで開く」と同じ wt.exe 経由。引数なしの `herdr` は永続セッション
+    へアタッチするので、socket 経由で作成済みの workspace が画面に出る。
+    """
+    script_path = '/tmp/cr_herdr_ui.sh'
+    lines = [
+        '#!/bin/zsh',
+        'source ~/.zshrc 2>/dev/null',
+        f'rm -f {shlex.quote(script_path)}',
+        'exec herdr',
+    ]
+    with open(script_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.chmod(script_path, 0o755)
+    subprocess.Popen(
+        ['/mnt/c/Windows/System32/cmd.exe', '/c', 'start', 'wt.exe',
+         '--window', '0', 'new-tab', '--',
+         'wsl.exe', '-e', script_path],
+        cwd='/mnt/c/'
+    )
+
+
+def _wait_for_socket(sock_path, timeout=8.0):
+    """ソケットファイルが現れるまで待つ（Herdr サーバ起動待ち）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(sock_path):
+            return True
+        time.sleep(0.3)
+    return os.path.exists(sock_path)
+
+
+def _herdr_rpc(sock_path, method, params, req_id):
+    """Herdr Socket API を1回呼び出す（1接続=1リクエスト）。
+
+    Herdr サーバは応答後に接続を閉じるため、呼び出しごとに接続を張り直す。
+    リクエスト/レスポンスは改行区切り JSON。id で応答を突き合わせ、
+    購読していないイベント行が混ざっても取り違えないようにする。
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    try:
+        sock.connect(sock_path)
+        req = json.dumps({'id': req_id, 'method': method, 'params': params})
+        sock.sendall((req + '\n').encode('utf-8'))
+
+        buf = b''
+        while True:
+            while b'\n' not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise RuntimeError('Herdrソケットが応答前に切断されました')
+                buf += chunk
+            line, buf = buf.split(b'\n', 1)
+            line = line.strip()
+            if not line:
+                continue
+            msg = json.loads(line.decode('utf-8'))
+            if msg.get('id') != req_id:
+                # 別リクエストの応答やイベント通知はスキップ
+                continue
+            if 'error' in msg:
+                err = msg['error'] or {}
+                raise RuntimeError(
+                    f"Herdr {method} エラー: {err.get('code', '?')}: {err.get('message', '')}")
+            return msg.get('result', {})
+    finally:
+        sock.close()
+
+
+def launch_in_herdr(project, session_id):
+    """選択した会話を Herdr の新規ワークスペースで `claude --resume` 復元する。
+
+    project ごとに workspace を作成し、その root_pane へ pane.send_text で
+    `claude --resume <id>` を送り込んで実行する。
+    """
+    sock_path = _herdr_socket_path()
+    ui_running = _herdr_ui_running()
+
+    if not os.path.exists(sock_path):
+        # サーバ未起動。UI を起動するとサーバも立ち上がるので、先に UI を起動し
+        # ソケットが現れるまで待ってから socket 処理に進む。
+        _spawn_herdr_ui()
+        ui_running = True  # 今起動したので後段での追加起動は不要
+        if not _wait_for_socket(sock_path):
+            raise RuntimeError(
+                f'Herdrサーバの起動を待ちましたが接続できませんでした: {sock_path}')
+
+    label = os.path.basename(project.rstrip('/')) if project else 'claude-resume'
+    ws_params = {}
+    if project:
+        ws_params['cwd'] = project
+    if label:
+        ws_params['label'] = label
+    ws = _herdr_rpc(sock_path, 'workspace.create', ws_params, 'cr_ws')
+
+    # 新規 workspace の既定ペインIDを取得する。workspace.create は
+    # result.root_pane.pane_id を返すのでそれを最優先で使い、構造が変わった
+    # 場合の保険として戻り値全体からペインID形式を正規表現で拾う。
+    pane_id = (ws.get('root_pane') or {}).get('pane_id')
+    if not pane_id:
+        match = _HERDR_PANE_RE.search(json.dumps(ws))
+        pane_id = match.group(1) if match else None
+    if not pane_id:
+        raise RuntimeError('Herdr: 新規workspaceのペインIDを取得できませんでした')
+
+    # pane.run というメソッドは存在しない。実APIでは pane.send_text で
+    # ペインのシェルへコマンド行を送り込む。workspace.create に cwd を
+    # 渡しておりペインは既に project ディレクトリで開始するため cd は不要。
+    # session_id は _SESSION_ID_RE で英数字・ハイフン・アンダースコアに
+    # 限定検証済みで、シェルメタ文字を含まないため安全に埋め込める。
+    _herdr_rpc(sock_path, 'pane.send_text',
+               {'pane_id': pane_id, 'text': f'claude --resume {session_id}\n'}, 'cr_run')
+
+    # 新規 workspace を前面化する（best-effort）。失敗しても復元自体は成功済み。
+    ws_id = (ws.get('workspace') or {}).get('workspace_id')
+    if ws_id:
+        try:
+            _herdr_rpc(sock_path, 'workspace.focus', {'workspace_id': ws_id}, 'cr_focus')
+        except Exception:
+            pass
+
+    # UI クライアントが起動していなければ立ち上げる。サーバだけ動いている状態では
+    # workspace は作られても画面に出ないため、ここで Herdr UI を起動して見せる。
+    if not ui_running:
+        _spawn_herdr_ui()
+
+    return pane_id
+
 
 class ClaudeResumeHandler(BaseHTTPRequestHandler):
     count = 10
@@ -2260,6 +2463,25 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
                         cwd='/mnt/c/'
                     )
                     self.wfile.write(json.dumps({"ok": True}).encode('utf-8'))
+                except Exception as e:
+                    self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode('utf-8'))
+            else:
+                err = "session_id required" if not session_id else "invalid session_id"
+                self.wfile.write(json.dumps({"ok": False, "error": err}).encode('utf-8'))
+
+        elif parsed.path == '/api/launch-herdr':
+            query = parse_qs(parsed.query)
+            project = query.get('project', [''])[0]
+            session_id = query.get('session_id', [''])[0]
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.end_headers()
+
+            if session_id and _SESSION_ID_RE.match(session_id):
+                try:
+                    pane_id = launch_in_herdr(project, session_id)
+                    self.wfile.write(json.dumps({"ok": True, "pane_id": pane_id}).encode('utf-8'))
                 except Exception as e:
                     self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode('utf-8'))
             else:
