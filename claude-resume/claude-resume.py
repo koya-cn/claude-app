@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import json
 import os
 import re
@@ -2294,6 +2295,58 @@ def _wait_for_socket(sock_path, timeout=8.0):
     return os.path.exists(sock_path)
 
 
+_POWERSHELL = '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe'
+
+# Herdr の Windows Terminal ウィンドウ（ウィンドウタイトルが "herdr"）を最前面化
+# する PowerShell。AttachThreadInput でフォアグラウンドロックを回避し、最小化時
+# のみ復元することで最大化状態を維持する。
+_HERDR_FOREGROUND_PS = '''Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class FgHerdr {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    public static bool Raise(IntPtr h) {
+        IntPtr fg = GetForegroundWindow();
+        uint pid;
+        uint tidFg = GetWindowThreadProcessId(fg, out pid);
+        uint tidMe = GetCurrentThreadId();
+        AttachThreadInput(tidMe, tidFg, true);
+        if (IsIconic(h)) { ShowWindow(h, 9); }
+        BringWindowToTop(h);
+        bool r = SetForegroundWindow(h);
+        AttachThreadInput(tidMe, tidFg, false);
+        return r;
+    }
+}
+"@
+$p = Get-Process WindowsTerminal -ErrorAction SilentlyContinue |
+     Where-Object { $_.MainWindowTitle -like '*herdr*' } |
+     Select-Object -First 1
+if ($p) { [FgHerdr]::Raise($p.MainWindowHandle) | Out-Null }
+'''
+
+
+def _foreground_herdr_window():
+    """Herdr の Windows Terminal ウィンドウを最前面化する（best-effort）。
+
+    エスケープ事故を避けるため PowerShell は -EncodedCommand（UTF-16LE の
+    base64）で渡す。Popen で投げっぱなしにし、失敗しても無視する。
+    """
+    try:
+        encoded = base64.b64encode(
+            _HERDR_FOREGROUND_PS.encode('utf-16-le')).decode('ascii')
+        subprocess.Popen([_POWERSHELL, '-NoProfile', '-EncodedCommand', encoded])
+    except Exception:
+        pass
+
+
 def _herdr_rpc(sock_path, method, params, req_id):
     """Herdr Socket API を1回呼び出す（1接続=1リクエスト）。
 
@@ -2332,11 +2385,24 @@ def _herdr_rpc(sock_path, method, params, req_id):
         sock.close()
 
 
-def launch_in_herdr(project, session_id):
-    """選択した会話を Herdr の新規ワークスペースで `claude --resume` 復元する。
+def _herdr_find_workspace(sock_path, label):
+    """label に一致する既存 workspace の workspace_id を返す（無ければ None）。"""
+    try:
+        wl = _herdr_rpc(sock_path, 'workspace.list', {}, 'cr_wl')
+    except Exception:
+        return None
+    for w in (wl.get('workspaces') or []):
+        if w.get('label') == label:
+            return w.get('workspace_id')
+    return None
 
-    project ごとに workspace を作成し、その root_pane へ pane.send_text で
-    `claude --resume <id>` を送り込んで実行する。
+
+def launch_in_herdr(project, session_id):
+    """選択した会話を Herdr のワークスペースで `claude --resume` 復元する。
+
+    プロジェクト別に workspace を用意する。同名 label の workspace が既に
+    あればそこへタブを追加し、無ければ新規作成する。対象ペインへ
+    pane.send_text で `cd <project> && claude --resume <id>` を送り実行する。
     """
     sock_path = _herdr_socket_path()
     ui_running = _herdr_ui_running()
@@ -2351,43 +2417,59 @@ def launch_in_herdr(project, session_id):
                 f'Herdrサーバの起動を待ちましたが接続できませんでした: {sock_path}')
 
     label = os.path.basename(project.rstrip('/')) if project else 'claude-resume'
-    ws_params = {}
-    if project:
-        ws_params['cwd'] = project
-    if label:
-        ws_params['label'] = label
-    ws = _herdr_rpc(sock_path, 'workspace.create', ws_params, 'cr_ws')
 
-    # 新規 workspace の既定ペインIDを取得する。workspace.create は
-    # result.root_pane.pane_id を返すのでそれを最優先で使い、構造が変わった
-    # 場合の保険として戻り値全体からペインID形式を正規表現で拾う。
-    pane_id = (ws.get('root_pane') or {}).get('pane_id')
+    # プロジェクト別 Workspace。同名 label の workspace があればそこへタブを
+    # 追加し、無ければ新規作成する。tab.create / workspace.create はいずれも
+    # result.root_pane.pane_id を返すので、そこから対象ペインIDを得る。
+    ws_id = _herdr_find_workspace(sock_path, label)
+    if ws_id:
+        target = _herdr_rpc(sock_path, 'tab.create',
+                            {'workspace_id': ws_id, 'label': session_id[:8]}, 'cr_tab')
+    else:
+        ws_params = {'label': label}
+        if project:
+            ws_params['cwd'] = project
+        target = _herdr_rpc(sock_path, 'workspace.create', ws_params, 'cr_ws')
+        ws_id = (target.get('workspace') or {}).get('workspace_id')
+
+    # 構造フィールドを最優先で使い、構造が変わった場合の保険として正規表現で拾う。
+    pane_id = (target.get('root_pane') or {}).get('pane_id')
     if not pane_id:
-        match = _HERDR_PANE_RE.search(json.dumps(ws))
+        match = _HERDR_PANE_RE.search(json.dumps(target))
         pane_id = match.group(1) if match else None
     if not pane_id:
-        raise RuntimeError('Herdr: 新規workspaceのペインIDを取得できませんでした')
+        raise RuntimeError('Herdr: 対象ペインIDを取得できませんでした')
 
-    # pane.run というメソッドは存在しない。実APIでは pane.send_text で
-    # ペインのシェルへコマンド行を送り込む。workspace.create に cwd を
-    # 渡しておりペインは既に project ディレクトリで開始するため cd は不要。
-    # session_id は _SESSION_ID_RE で英数字・ハイフン・アンダースコアに
-    # 限定検証済みで、シェルメタ文字を含まないため安全に埋め込める。
-    _herdr_rpc(sock_path, 'pane.send_text',
-               {'pane_id': pane_id, 'text': f'claude --resume {session_id}\n'}, 'cr_run')
+    # pane.run というメソッドは存在しない。実APIでは pane.send_text でペインの
+    # シェルへコマンド行を送り込む。既存 workspace へのタブは workspace 作成時の
+    # cwd を継承しプロジェクトと一致しないことがあるため、明示的に cd してから
+    # resume する。project は shlex.quote でシェル安全化、session_id は
+    # _SESSION_ID_RE 検証済みでシェルメタ文字を含まない。
+    if project:
+        text = f'cd {shlex.quote(project)} && claude --resume {session_id}\n'
+    else:
+        text = f'claude --resume {session_id}\n'
+    _herdr_rpc(sock_path, 'pane.send_text', {'pane_id': pane_id, 'text': text}, 'cr_run')
 
-    # 新規 workspace を前面化する（best-effort）。失敗しても復元自体は成功済み。
-    ws_id = (ws.get('workspace') or {}).get('workspace_id')
-    if ws_id:
-        try:
-            _herdr_rpc(sock_path, 'workspace.focus', {'workspace_id': ws_id}, 'cr_focus')
-        except Exception:
-            pass
+    # 新しいタブ/ワークスペースを Herdr 内で前面化する（best-effort）。
+    # 失敗しても復元自体は成功済み。
+    try:
+        _herdr_rpc(sock_path, 'workspace.focus', {'workspace_id': ws_id}, 'cr_wfocus')
+    except Exception:
+        pass
+    try:
+        _herdr_rpc(sock_path, 'pane.focus', {'pane_id': pane_id}, 'cr_pfocus')
+    except Exception:
+        pass
 
     # UI クライアントが起動していなければ立ち上げる。サーバだけ動いている状態では
-    # workspace は作られても画面に出ないため、ここで Herdr UI を起動して見せる。
+    # workspace は作られても画面に出ないため、ここで Herdr UI を起動して見せる
+    # （wt.exe の新規タブ起動でウィンドウも前面化される）。既に起動済みなら
+    # ウィンドウを最前面化する。
     if not ui_running:
         _spawn_herdr_ui()
+    else:
+        _foreground_herdr_window()
 
     return pane_id
 
