@@ -37,8 +37,10 @@ if [ -n "$existing" ]; then
 fi
 
 tmp=$(mktemp)
+# refreshInterval を入れないとイベント発生時しか再描画されず、
+# レート制限で操作が止まっている間は残時間表示が固まったままになる
 jq --arg cmd "bash $STATUSLINE_SH" \
-  '.statusLine = {"type": "command", "command": $cmd}' \
+  '.statusLine = {"type": "command", "command": $cmd, "refreshInterval": 60}' \
   "$SETTINGS" > "$tmp" && mv "$tmp" "$SETTINGS"
 
 echo "Done: statusLine -> $STATUSLINE_SH"
