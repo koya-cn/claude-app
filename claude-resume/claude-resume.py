@@ -1267,6 +1267,9 @@ HTML_TEMPLATE = """<!doctype html>
 
   .ld-sr-container { padding: 16px; }
   .ld-sr-header { color: #888; font-size: 11px; margin-bottom: 12px; }
+  .ld-inc-group-header { font-size: 11px; font-weight: 600; margin: 4px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #1f1f23; }
+  .ld-inc-group-header.triaged { color: #fbbf24; }
+  .ld-inc-group-header.rest { color: #6b7280; margin-top: 18px; }
   .ld-search-result { background: #131316; border: 1px solid #1f1f23; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
   .ld-role-badge { display: inline-block; padding: 2px 7px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 8px; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; }
   .ld-role-badge.user { background: #1a1709; color: #fbbf24; }
@@ -1975,7 +1978,35 @@ const App = () => {
                 if (cands.length === 0) {
                   return <div className="ld-loading">このプロジェクトに未完了の候補はありません</div>;
                 }
-                // 優先度（strength→新しさ）順に全件表示
+                // トリアージ済みなら、AI が残した候補を上位に並べ替え
+                const triagedSids = (incTriage && incTriage.items)
+                  ? new Set(incTriage.items.map(it => it.session_id))
+                  : null;
+                if (triagedSids && triagedSids.size > 0) {
+                  const hit = cands.filter(c => triagedSids.has(c.session_id));
+                  const rest = cands.filter(c => !triagedSids.has(c.session_id));
+                  let idx = 0;
+                  return (
+                    <>
+                      <div className="ld-sr-header">
+                        未完了の候補: {cands.length}件{incFilterProject !== 'all' ? `（${incFilterProject}）` : ''}・トリアージ順
+                      </div>
+                      {hit.length > 0 && (
+                        <>
+                          <div className="ld-inc-group-header triaged">★ トリアージ該当（{hit.length}件）</div>
+                          {hit.map(c => renderIncCard(c, idx++))}
+                        </>
+                      )}
+                      {rest.length > 0 && (
+                        <>
+                          <div className="ld-inc-group-header rest">その他の候補（{rest.length}件）</div>
+                          {rest.map(c => renderIncCard(c, idx++))}
+                        </>
+                      )}
+                    </>
+                  );
+                }
+                // 未トリアージ時は優先度（strength→新しさ）順に全件表示
                 return (
                   <>
                     <div className="ld-sr-header">
