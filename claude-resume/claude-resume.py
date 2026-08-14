@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import concurrent.futures
 import json
 import os
 import re
@@ -459,6 +460,90 @@ def load_session_detail(session_id, target_dirs):
                 pass
             return items
     return []
+
+
+_PR_URL_RE = re.compile(
+    r'https://github\.com/([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)/pull/(\d+)')
+
+# gitBranch がこれらのときは「作業ブランチ」とみなさない（detached HEAD や既定ブランチ）
+_NON_FEATURE_BRANCHES = {"", "main", "master", "HEAD"}
+
+
+# PR 候補として gh に問い合わせる上限。セッション本文には無関係な PR URL が大量に出るため、
+# 総当たりせず新しいものから数件だけ head ブランチの一致を確認する。
+_PR_CANDIDATE_LIMIT = 3
+
+
+def extract_pr_hints(session_id, target_dirs):
+    """セッションの JSONL から PR を特定する手がかりを1パスで集める。
+
+    主キーは **最後に作業していたブランチ**（最後の非既定 gitBranch）。
+    セッション本文には調査対象の他人の PR や過去の PR の URL が頻繁に現れるため、
+    pr-link / 本文 URL は「候補」に留め、head ブランチが一致したものだけを採用する
+    （一致検証は resolve_pr_state 側で行う）。
+    """
+    empty = {"branch": None, "cwd": None, "pr_candidates": []}
+    for base_dir in target_dirs:
+        projects_dir = base_dir / "projects"
+        if not projects_dir.exists():
+            continue
+        for project_dir in projects_dir.iterdir():
+            if not project_dir.is_dir():
+                continue
+            jsonl_file = project_dir / f"{session_id}.jsonl"
+            if not jsonl_file.exists():
+                continue
+            pr_links = []   # 出現順の (repo, number)
+            pr_texts = []
+            branch = None
+            cwd = None
+            try:
+                with open(jsonl_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        # 本文・ツール出力のどこに出ても拾えるよう行全体に当てる
+                        for m in _PR_URL_RE.finditer(line):
+                            pr_texts.append((m.group(1), int(m.group(2))))
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        if entry.get('type') == 'pr-link':
+                            repo = entry.get('prRepository')
+                            num = entry.get('prNumber')
+                            if repo and num:
+                                try:
+                                    pr_links.append((str(repo), int(num)))
+                                except (TypeError, ValueError):
+                                    pass
+                        b = entry.get('gitBranch')
+                        if isinstance(b, str) and b not in _NON_FEATURE_BRANCHES:
+                            branch = b
+                        c = entry.get('cwd')
+                        if isinstance(c, str) and c:
+                            cwd = c
+            except (OSError, UnicodeDecodeError):
+                return empty
+            # 新しいものから、pr-link を優先して重複を除いた候補列を作る
+            candidates = []
+            seen = set()
+            for src, pairs in (("pr-link", pr_links), ("pr-url", pr_texts)):
+                for repo, num in reversed(pairs):
+                    key = (repo, num)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append((repo, num, src))
+                    if len(candidates) >= _PR_CANDIDATE_LIMIT:
+                        break
+                if len(candidates) >= _PR_CANDIDATE_LIMIT:
+                    break
+            return {"branch": branch, "cwd": cwd, "pr_candidates": candidates}
+    return empty
 
 
 def format_timestamp(ts_ms):
@@ -1022,6 +1107,329 @@ def incomplete_signature(candidates):
     return f"{len(candidates)}|" + "|".join(sorted(parts))
 
 
+# ---------------------------------------------------------------------------
+# PR マージ状態の判定（未完了候補が main に取り込まれ済みかを確認する）
+# ---------------------------------------------------------------------------
+
+PR_STATE_FILE = Path.home() / ".claude-resume-prstate.json"
+# 判定ロジックを変えたら上げる。古い（誤った紐付けを含む）キャッシュを破棄するため
+PR_STATE_VERSION = 2
+# マージ済み PR は終局状態なので無期限キャッシュ。それ以外は状態が変わり得るため TTL を効かせる
+PR_STATE_TTL = 600
+_GH_TIMEOUT = 15
+
+_default_branch_cache = {}
+
+
+def _run_cmd(argv, cwd=None, timeout=_GH_TIMEOUT):
+    """外部コマンドを実行し (stdout, None) / (None, 理由文字列) を返す。例外は外に出さない。"""
+    try:
+        result = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return None, f"{argv[0]} がタイムアウトしました（{timeout}秒）"
+    except Exception as e:
+        return None, f"{argv[0]} の実行に失敗: {e}"
+    if result.returncode != 0:
+        return None, (result.stderr or "").strip()[:300] or f"exit {result.returncode}"
+    return (result.stdout or "").strip(), None
+
+
+def _gh_available():
+    return shutil.which("gh") is not None
+
+
+def _default_branch(cwd):
+    """リポジトリの既定ブランチ名。origin/HEAD をローカルで引くだけでネットワーク不要。"""
+    if not cwd:
+        return "main"
+    if cwd in _default_branch_cache:
+        return _default_branch_cache[cwd]
+    out, _ = _run_cmd(
+        ["git", "-C", cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        timeout=5,
+    )
+    branch = "main"
+    if out:
+        # "origin/main" の形で返るので最後の要素を取る
+        branch = out.split("/")[-1] or "main"
+    _default_branch_cache[cwd] = branch
+    return branch
+
+
+def _gh_pr_view(repo, number):
+    """PR 番号が判っている場合の状態取得。成功時は dict、失敗時は (None, 理由)。"""
+    out, err = _run_cmd([
+        "gh", "api", f"repos/{repo}/pulls/{number}",
+        "--jq", '{state: .state, merged_at: .merged_at, base: .base.ref, '
+                'head: .head.ref, title: .title, url: .html_url}',
+    ])
+    if err:
+        return None, err
+    try:
+        data = json.loads(out)
+    except (ValueError, TypeError):
+        return None, "gh の応答を解釈できませんでした"
+    return data, None
+
+
+def _gh_pr_by_branch(cwd, branch):
+    """ブランチ名から PR を解決する。同名で複数ある場合は最新（番号最大）を採用。"""
+    if not cwd or not Path(cwd).is_dir():
+        return None, "リポジトリのディレクトリが見つかりません"
+    out, err = _run_cmd([
+        "gh", "pr", "list", "--head", branch, "--state", "all", "--limit", "5",
+        "--json", "number,state,mergedAt,baseRefName,headRefName,url,title",
+    ], cwd=cwd)
+    if err:
+        return None, err
+    try:
+        rows = json.loads(out) if out else []
+    except (ValueError, TypeError):
+        return None, "gh の応答を解釈できませんでした"
+    if not rows:
+        return None, None  # PR 自体が無い（エラーではない）
+    row = max(rows, key=lambda r: r.get("number") or 0)
+    return {
+        "number": row.get("number"),
+        "state": (row.get("state") or "").lower(),
+        "merged_at": row.get("mergedAt"),
+        "base": row.get("baseRefName"),
+        "head": row.get("headRefName") or branch,
+        "title": row.get("title"),
+        "url": row.get("url"),
+    }, None
+
+
+def load_pr_state_cache():
+    """{"version": n, "prs": {...}, "links": {...}} を返す。
+
+    version が合わないキャッシュ（head ブランチ検証を導入する前のもの等）は
+    誤った紐付けを引き継がないよう破棄する。
+    """
+    empty = {"version": PR_STATE_VERSION, "prs": {}, "links": {}}
+    try:
+        with open(PR_STATE_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return empty
+    if not isinstance(data, dict) or data.get("version") != PR_STATE_VERSION:
+        return empty
+    prs = data.get("prs")
+    links = data.get("links")
+    return {
+        "version": PR_STATE_VERSION,
+        "prs": prs if isinstance(prs, dict) else {},
+        "links": links if isinstance(links, dict) else {},
+    }
+
+
+def save_pr_state_cache(cache):
+    try:
+        cache["version"] = PR_STATE_VERSION
+        with open(PR_STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError:
+        return False
+
+
+def _pr_cache_fresh(entry):
+    """PR 状態キャッシュが使えるか。マージ済みは終局なので無期限に使う。"""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("merged_at"):
+        return True
+    try:
+        return (time.time() - float(entry.get("checked_at_epoch", 0))) < PR_STATE_TTL
+    except (TypeError, ValueError):
+        return False
+
+
+def _classify_pr(pr, cwd):
+    """gh から得た PR 情報を UI 向けの status / merged_to_default に落とす。"""
+    base = pr.get("base") or ""
+    if pr.get("merged_at"):
+        status = "merged"
+    elif (pr.get("state") or "").lower() == "closed":
+        status = "closed"
+    else:
+        status = "open"
+    return {
+        "status": status,
+        "number": pr.get("number"),
+        "base": base,
+        "title": pr.get("title") or "",
+        "url": pr.get("url") or "",
+        "merged_at": pr.get("merged_at"),
+        "merged_to_default": status == "merged" and base == _default_branch(cwd),
+    }
+
+
+def _pr_cache_entry(pr):
+    """PR 情報にキャッシュ用のタイムスタンプを付ける。"""
+    entry = dict(pr)
+    entry["checked_at_epoch"] = time.time()
+    entry["checked_at"] = datetime.now(timezone.utc).isoformat()
+    return entry
+
+
+def _fetch_pr(repo, number, cache, refresh):
+    """キャッシュ優先で PR 情報を取得する。戻りは (pr, err, cache_entry|None)。"""
+    key = f"{repo}#{number}"
+    cached = cache["prs"].get(key)
+    if not refresh and _pr_cache_fresh(cached):
+        return cached, None, None
+    pr, err = _gh_pr_view(repo, number)
+    if err or not pr:
+        return None, err or "PR 情報を取得できませんでした", None
+    pr["number"] = number
+    return pr, None, (key, _pr_cache_entry(pr))
+
+
+def resolve_pr_state(candidate, target_dirs, cache, refresh=False):
+    """1 候補について PR を特定し、マージ状態を返す。cache は読み取り専用に扱う。
+
+    **セッションの最後の作業ブランチと PR の head ブランチが一致すること**を必須条件に
+    している。セッション本文には調査対象の他人の PR や過去の PR の URL が頻繁に現れ、
+    それを採用すると無関係な PR のマージ状態を「このセッションは完了」と誤判定するため。
+    作業ブランチが判らないセッションは判定対象外（no_pr）とする。
+
+    戻り値は (session_id, item, new_pr_cache_entry|None, new_link_entry|None)。
+    キャッシュへの書き込みは呼び出し側でまとめて行う（スレッド間の競合を避ける）。
+    """
+    sid = candidate["session_id"]
+    last_ts = candidate.get("last_ts")
+    link = cache["links"].get(sid) if not refresh else None
+    if link and link.get("last_ts") == last_ts:
+        hints = {
+            "branch": link.get("branch"),
+            "cwd": link.get("cwd") or candidate.get("project"),
+            "pr_candidates": [],
+        }
+        resolved = (link.get("repo"), link.get("number"), link.get("source") or "")
+    else:
+        hints = extract_pr_hints(sid, target_dirs)
+        if not hints.get("cwd"):
+            proj = candidate.get("project")
+            if proj and proj != "(Global/No Directory)":
+                hints["cwd"] = proj
+        resolved = None
+
+    branch = hints.get("branch")
+    cwd = hints.get("cwd")
+    base_item = {
+        "status": "no_pr",
+        "repo": None,
+        "number": None,
+        "url": "",
+        "title": "",
+        "base": "",
+        "head": "",
+        "merged_to_default": False,
+        "source": "",
+        "branch": branch,
+        "error": "",
+    }
+    new_link = {
+        "repo": None, "number": None, "source": "",
+        "branch": branch, "cwd": cwd, "last_ts": last_ts,
+    }
+
+    # 作業ブランチが判らないセッションは、どの PR が成果物なのか特定できない
+    if not branch:
+        return sid, base_item, None, new_link
+
+    def finalize(pr, source, repo, pr_entry):
+        item = dict(base_item)
+        item.update(_classify_pr(pr, cwd))
+        item["repo"] = repo
+        item["head"] = pr.get("head") or branch
+        item["source"] = source
+        new_link.update({"repo": repo, "number": pr.get("number"), "source": source})
+        return sid, item, pr_entry, new_link
+
+    # 0) 前回すでに紐付けが確定している場合は、その PR だけを引き直す
+    if resolved and resolved[0] and resolved[1]:
+        pr, err, pr_entry = _fetch_pr(resolved[0], resolved[1], cache, refresh)
+        if pr and (pr.get("head") or branch) == branch:
+            return finalize(pr, resolved[2] or "link", resolved[0], pr_entry)
+        # head が食い違う／取得できない場合は下の通常解決にフォールバックする
+
+    # 1) 作業ブランチから PR を引く（head 一致が自明なので最も信頼できる）
+    if cwd and Path(cwd).is_dir():
+        pr, err = _gh_pr_by_branch(cwd, branch)
+        if pr:
+            repo_out, _ = _run_cmd(
+                ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+                cwd=cwd, timeout=10,
+            )
+            repo = repo_out or None
+            pr_entry = (f"{repo}#{pr.get('number')}", _pr_cache_entry(pr)) if repo else None
+            return finalize(pr, "branch", repo, pr_entry)
+        if not err:
+            # ブランチに対応する PR が無い（＝まだ PR を作っていない）
+            return sid, base_item, None, new_link
+        branch_err = err
+    else:
+        branch_err = "リポジトリのディレクトリが見つかりません"
+
+    # 2) リポジトリが手元に無い場合のみ、本文中の PR 候補を head 一致で検証する
+    last_err = branch_err
+    for repo, number, source in hints.get("pr_candidates", []):
+        pr, err, pr_entry = _fetch_pr(repo, number, cache, refresh)
+        if err:
+            last_err = err
+            continue
+        if (pr.get("head") or "") == branch:
+            return finalize(pr, source, repo, pr_entry)
+
+    item = dict(base_item)
+    item["status"] = "error"
+    item["error"] = last_err or "PR を特定できませんでした"
+    return sid, item, None, new_link
+
+
+def check_pr_states(candidates, target_dirs, refresh=False, max_workers=6):
+    """未完了候補ごとの PR マージ状態をまとめて返す。gh 不在時は空の結果を返す。"""
+    if not _gh_available():
+        return {}, False
+    cache = load_pr_state_cache()
+    items = {}
+    pr_updates = {}
+    link_updates = {}
+
+    def work(c):
+        try:
+            return resolve_pr_state(c, target_dirs, cache, refresh=refresh)
+        except Exception as e:
+            return c["session_id"], {
+                "status": "error", "repo": None, "number": None, "url": "", "title": "",
+                "base": "", "head": "", "merged_to_default": False, "source": "",
+                "branch": None, "error": f"判定に失敗: {e}",
+            }, None, None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for sid, item, pr_entry, link in pool.map(work, candidates):
+            items[sid] = item
+            if pr_entry:
+                pr_updates[pr_entry[0]] = pr_entry[1]
+            if link:
+                link_updates[sid] = link
+
+    if pr_updates or link_updates:
+        cache["prs"].update(pr_updates)
+        cache["links"].update(link_updates)
+        save_pr_state_cache(cache)
+    return items, True
+
+
 def build_incomplete_triage_prompt(candidates):
     """未完了候補を Claude に渡してトリアージ（分類・ノイズ除去）させるプロンプト。
 
@@ -1270,6 +1678,13 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-inc-group-header { font-size: 11px; font-weight: 600; margin: 4px 0 10px; padding-bottom: 6px; border-bottom: 1px solid #1f1f23; }
   .ld-inc-group-header.triaged { color: #fbbf24; }
   .ld-inc-group-header.rest { color: #6b7280; margin-top: 18px; }
+  .ld-inc-pr { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; margin-top: 8px; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-family: 'JetBrains Mono', monospace; border: 1px solid transparent; }
+  .ld-inc-pr.merged { color: #6ee7a8; background: #0d2419; border-color: #1c4634; }
+  .ld-inc-pr.open { color: #7dd3fc; background: #0c1e2b; border-color: #1e3f52; }
+  .ld-inc-pr.closed { color: #f0a3a3; background: #2a1414; border-color: #4a2323; }
+  .ld-inc-pr.error { color: #6b7280; background: #17171a; border-color: #26262b; cursor: default; }
+  .ld-inc-pr:hover { filter: brightness(1.25); }
+  .ld-inc-prbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px; }
   .ld-search-result { background: #131316; border: 1px solid #1f1f23; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
   .ld-role-badge { display: inline-block; padding: 2px 7px; border-radius: 3px; font-size: 10px; font-weight: 600; margin-right: 8px; font-family: 'JetBrains Mono', monospace; text-transform: uppercase; }
   .ld-role-badge.user { background: #1a1709; color: #fbbf24; }
@@ -1367,6 +1782,10 @@ const App = () => {
   const [incStaleSessions, setIncStaleSessions] = React.useState([]);
   // 内部リンクで選択中のセッション（カードを継続ハイライト）
   const [incActiveSid, setIncActiveSid] = React.useState(null);
+  // 候補ごとの PR マージ状態（session_id -> {status, number, base, ...}）
+  const [incPrState, setIncPrState] = React.useState({});
+  const [incPrLoading, setIncPrLoading] = React.useState(false);
+  const [incPrError, setIncPrError] = React.useState('');
 
   const INC_KEY = 'claude-resume:incomplete:v2';
 
@@ -1507,6 +1926,25 @@ const App = () => {
     setTimeout(() => el.classList.remove('ld-inc-flash'), 1200);
   };
 
+  // 候補の PR マージ状態を取得する。gh 呼び出しを含むため一覧表示は待たせない。
+  const loadPrState = async (refresh) => {
+    setIncPrLoading(true);
+    setIncPrError('');
+    try {
+      const res = await fetch('/api/incomplete/prstate' + (refresh ? '?refresh=1' : ''));
+      const data = await res.json();
+      if (!data.gh_available) {
+        setIncPrError('gh コマンドが見つからないため、PR のマージ状態は確認できません');
+        setIncPrState({});
+      } else {
+        setIncPrState(data.items || {});
+      }
+    } catch (e) {
+      setIncPrError('PR 状態の取得に失敗しました: ' + e);
+    }
+    setIncPrLoading(false);
+  };
+
   const openIncomplete = async () => {
     setView('incomplete');
     setIncFilterProject('all');
@@ -1514,6 +1952,8 @@ const App = () => {
     setIncLoading(true);
     setIncTriage(null);
     setIncTriageStale(false);
+    setIncPrState({});
+    setIncPrError('');
     try {
       const res = await fetch('/api/incomplete');
       const data = await res.json();
@@ -1545,6 +1985,8 @@ const App = () => {
       }
     } catch (e) { setIncCandidates([]); }
     setIncLoading(false);
+    // PR マージ状態は候補一覧の描画をブロックしないよう、あとから反映する
+    loadPrState(false);
   };
 
   const generateTriage = async () => {
@@ -1607,6 +2049,78 @@ const App = () => {
     });
   };
 
+  // main へマージ済みの候補をまとめて「完了」にする
+  const markMergedDone = async (targets) => {
+    if (!targets.length) return;
+    const label = targets.slice(0, 5)
+      .map(c => '・#' + (incPrState[c.session_id] || {}).number + ' ' + c.project_name)
+      .join('\\n');
+    const more = targets.length > 5 ? '\\n…ほか' + (targets.length - 5) + '件' : '';
+    if (!window.confirm('マージ済みの' + targets.length + '件を完了にします。\\n\\n'
+                        + label + more + '\\n\\n実行しますか？')) return;
+    for (const c of targets) {
+      await markIncDone(c);
+    }
+  };
+
+  // PR のマージ状態バッジ。PR が特定できなかった候補には何も出さない。
+  const renderPrBadge = (c) => {
+    const pr = incPrState[c.session_id];
+    if (!pr || pr.status === 'no_pr') return null;
+    const stop = (e) => e.stopPropagation();
+    if (pr.status === 'error') {
+      return (
+        <div className="ld-inc-pr error" onClick={stop} title={pr.error}>
+          PR 状態を取得できませんでした
+        </div>
+      );
+    }
+    const num = pr.number ? '#' + pr.number : 'PR';
+    const label = pr.status === 'merged'
+      ? num + ' ' + (pr.base || '?') + ' にマージ済み'
+      : (pr.status === 'closed' ? num + ' クローズ（未マージ）' : num + ' オープン中');
+    const openPr = (e) => {
+      stop(e);
+      if (pr.url) window.open(pr.url, '_blank');
+    };
+    return (
+      <div className={'ld-inc-pr ' + pr.status} onClick={openPr}
+           title={(pr.title || '')
+                  + (pr.head ? '\\nブランチ: ' + pr.head : '')
+                  + (pr.url ? '\\n' + pr.url : '')}>
+        {label}
+      </div>
+    );
+  };
+
+  // 一覧ヘッダ直下の PR 操作バー（マージ済みの一括完了・再確認）
+  const renderPrBar = (cands) => {
+    const merged = cands.filter(c => {
+      const pr = incPrState[c.session_id];
+      return pr && pr.status === 'merged' && pr.merged_to_default;
+    });
+    return (
+      <div className="ld-inc-prbar">
+        {incPrLoading && <span className="ld-summary-time">PR のマージ状態を確認中…</span>}
+        {!incPrLoading && incPrError && <span className="ld-inc-error">⚠ {incPrError}</span>}
+        {!incPrLoading && !incPrError && merged.length > 0 && (
+          <button className="ld-btn done" style={{height:'20px', fontSize:'10px', padding:'0 7px'}}
+                  title="既定ブランチへマージ済みの候補をまとめて完了にします"
+                  onClick={() => markMergedDone(merged)}>
+            ✓ マージ済み {merged.length}件を完了にする
+          </button>
+        )}
+        {!incPrLoading && !incPrError && merged.length === 0 && (
+          <span className="ld-summary-time">マージ済みの候補はありません</span>
+        )}
+        {!incPrLoading && (
+          <button className="ld-btn" style={{height:'20px', fontSize:'10px', padding:'0 7px'}}
+                  onClick={() => loadPrState(true)}>マージ状態を再確認</button>
+        )}
+      </div>
+    );
+  };
+
   const renderIncCard = (c, i) => {
     const proj = c.project && c.project !== '(Global/No Directory)' ? c.project : '';
     const cmd = proj
@@ -1632,6 +2146,7 @@ const App = () => {
         <div className="ld-inc-signals">
           {(c.signals || []).map((s, j) => <span key={j} className="ld-inc-sig">{s}</span>)}
         </div>
+        {renderPrBadge(c)}
         {(c.evidence || []).filter(ev => ev.text).map((ev, j) => (
           <div key={j} className="ld-inc-evidence"><span className="lbl">{ev.label}:</span>{ev.text}</div>
         ))}
@@ -1991,6 +2506,7 @@ const App = () => {
                       <div className="ld-sr-header">
                         未完了の候補: {cands.length}件{incFilterProject !== 'all' ? `（${incFilterProject}）` : ''}・トリアージ順
                       </div>
+                      {renderPrBar(cands)}
                       {hit.length > 0 && (
                         <>
                           <div className="ld-inc-group-header triaged">★ トリアージ該当（{hit.length}件）</div>
@@ -2012,6 +2528,7 @@ const App = () => {
                     <div className="ld-sr-header">
                       未完了の候補: {cands.length}件{incFilterProject !== 'all' ? `（${incFilterProject}）` : ''}・優先度順
                     </div>
+                    {renderPrBar(cands)}
                     {cands.map((c, i) => renderIncCard(c, i))}
                   </>
                 );
@@ -2650,6 +3167,27 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps({
                 "candidates": candidates,
                 "signature": incomplete_signature(candidates),
+            }, ensure_ascii=False).encode('utf-8'))
+
+        elif parsed.path == '/api/incomplete/prstate':
+            # 未完了候補ごとに PR を特定し、main へマージ済みかを判定して返す
+            query = parse_qs(parsed.query)
+            strict = query.get('strict', ['0'])[0] in ('1', 'true')
+            refresh = query.get('refresh', ['0'])[0] in ('1', 'true')
+            candidates = scan_incomplete_sessions(200, strict=strict, debug=self.debug)
+            items, gh_ok = check_pr_states(
+                candidates, self.target_dirs, refresh=refresh)
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "ok": True,
+                "items": items,
+                "signature": incomplete_signature(candidates),
+                "checked": len(items),
+                "merged": sum(1 for v in items.values() if v.get("status") == "merged"),
+                "gh_available": gh_ok,
             }, ensure_ascii=False).encode('utf-8'))
 
         elif parsed.path == '/api/incomplete/summary':
