@@ -188,6 +188,7 @@ def fuzzy_search_prompts(keyword, target_dirs=None, debug=False, return_data=Fal
 # ─── 直近セッション一覧（新機能） ────────────────────────────────────────────
 
 def load_recent_sessions(count=5, debug=False):
+    """直近セッションを新しい順に返す。count が None / 0 以下なら全件返す。"""
     target_dirs = load_target_dirs(debug=debug)
 
     sessions = {}      # sessionId -> dict (history.jsonl 由来)
@@ -309,7 +310,7 @@ def load_recent_sessions(count=5, debug=False):
         sess["messages"] = load_session_messages(sess["session_id"], target_dirs)
         if sess["messages"]:
             result.append(sess)
-        if len(result) >= count:
+        if count and count > 0 and len(result) >= count:
             break
     return result
 
@@ -1066,7 +1067,7 @@ def _is_marked_done(done_map, session_id, last_ts):
         return True
 
 
-def scan_incomplete_sessions(limit=200, strict=False, debug=False):
+def scan_incomplete_sessions(limit=None, strict=False, debug=False):
     """全セッションを走査し、未完了候補を優先度（strength→新しさ）順で返す。
 
     strict=True のときは tier="strong"（明確なシグナル有）のみを返す。
@@ -1564,13 +1565,31 @@ def display_incomplete(candidates):
 
 # ─── Web UI 機能 ──────────────────────────────────────────────────────────────
 
+_PREVIEW_MAXLEN = 70
+
+
+def _session_preview(messages):
+    """一覧行に出す最初のユーザー発言（空白を潰して先頭70文字）"""
+    for role, text in messages:
+        if role == "user":
+            return " ".join(text.split())[:_PREVIEW_MAXLEN]
+    return ""
+
+
 def sessions_to_json_compatible(sessions):
-    """セッションデータをJSON互換形式に変換"""
+    """一覧APIの JSON に変換する。
+
+    本文（messages）と prompts はフロントが使わないため送らない。全件表示でも
+    ペイロードが肥大しないよう、必要な msg_count と preview だけを持たせる。
+    msg_count は /api/summary・/api/session/{id} の message_count と同じ
+    len(load_session_messages(...)) なので、要約キャッシュの整合が保たれる。
+    """
     result = []
     for s in sessions:
-        d = dict(s)
-        # tuple を list に変換
-        d["messages"] = [[role, text] for role, text in s.get("messages", [])]
+        messages = s.get("messages", [])
+        d = {k: v for k, v in s.items() if k not in ("messages", "prompts")}
+        d["msg_count"] = len(messages)
+        d["preview"] = _session_preview(messages)
         result.append(d)
     return result
 
@@ -1790,7 +1809,7 @@ const App = () => {
   const INC_KEY = 'claude-resume:incomplete:v2';
 
   React.useEffect(() => {
-    fetch('/api/sessions?n=50')
+    fetch('/api/sessions')
       .then(r => r.json())
       .then(data => { setSessions(data); setLoading(false); })
       .catch(() => setLoading(false));
@@ -2133,7 +2152,6 @@ const App = () => {
       project_name: c.project_name,
       session_name: (c.intent || '').slice(0, 60) || '(未完了セッション)',
       last_ts: c.last_ts,
-      messages: [],
     });
     return (
       <div key={c.session_id + i} id={'inc-card-' + c.session_id}
@@ -2239,7 +2257,6 @@ const App = () => {
       project_name: projName,
       session_name: r.prompt.slice(0, 60),
       last_ts: Date.now(),
-      messages: [],
     });
   };
 
@@ -2303,13 +2320,7 @@ const App = () => {
     return dy + '日前';
   };
 
-  const getPreview = (s) => {
-    if (!s.messages || s.messages.length === 0) return s.session_name || '';
-    for (const [role, text] of s.messages) {
-      if (role === 'user') return text.replace(/\s+/g, ' ').slice(0, 70);
-    }
-    return '';
-  };
+  const getPreview = (s) => s.preview || s.session_name || '';
 
   React.useEffect(() => {
     const onKey = (e) => {
@@ -2616,10 +2627,10 @@ const App = () => {
                          className={`ld-row ${i===selected ? 'sel' : ''}`}
                          onClick={() => { setSelected(i); openDetail(s); }}>
                       <span className={`ld-status ${
-                        cachedSummaries[s.session_id] === (s.messages ? s.messages.length : 0)
+                        cachedSummaries[s.session_id] === s.msg_count
                           ? 'active' : 'idle'
                       }`} title={
-                        cachedSummaries[s.session_id] === (s.messages ? s.messages.length : 0)
+                        cachedSummaries[s.session_id] === s.msg_count
                           ? 'AI 要約済み' : ''
                       }></span>
                       <span className="ld-proj" title={s.project}>{s.project_name}</span>
@@ -2627,7 +2638,7 @@ const App = () => {
                         {s.session_name || '(名前なし)'}
                         <span className="pv">{getPreview(s)}</span>
                       </span>
-                      <span className="ld-stats">{s.messages ? s.messages.length : 0}</span>
+                      <span className="ld-stats">{s.msg_count}</span>
                       <span className="ld-time">{relTime(s.last_ts)}</span>
                     </div>
                   ))
@@ -2680,7 +2691,7 @@ const App = () => {
               <div className="ld-sheet-meta">
                 <span title={openSession.project}>{openSession.project || '—'}</span>
                 <span>·</span>
-                <span>{openSession.messages ? openSession.messages.length : 0} msgs</span>
+                <span>{modalMessages ? modalMessages.length : (openSession.msg_count || 0)} msgs</span>
               </div>
             </div>
 
@@ -3023,7 +3034,7 @@ def launch_in_herdr(project, session_id):
 
 
 class ClaudeResumeHandler(BaseHTTPRequestHandler):
-    count = 10
+    count = 0  # 0 = 全件
     debug = False
     target_dirs = None
 
@@ -3159,7 +3170,7 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             # 全セッションを走査して未完了候補を返す（ヒューリスティック・軽量）
             query = parse_qs(parsed.query)
             strict = query.get('strict', ['0'])[0] in ('1', 'true')
-            candidates = scan_incomplete_sessions(200, strict=strict, debug=self.debug)
+            candidates = scan_incomplete_sessions(strict=strict, debug=self.debug)
 
             self.send_response(200)
             self.send_header('Content-type', 'application/json; charset=utf-8')
@@ -3174,7 +3185,7 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             strict = query.get('strict', ['0'])[0] in ('1', 'true')
             refresh = query.get('refresh', ['0'])[0] in ('1', 'true')
-            candidates = scan_incomplete_sessions(200, strict=strict, debug=self.debug)
+            candidates = scan_incomplete_sessions(strict=strict, debug=self.debug)
             items, gh_ok = check_pr_states(
                 candidates, self.target_dirs, refresh=refresh)
 
@@ -3194,7 +3205,7 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             # 未完了候補を Claude(Haiku) でトリアージ・分類した結果を返す
             query = parse_qs(parsed.query)
             strict = query.get('strict', ['0'])[0] in ('1', 'true')
-            candidates = scan_incomplete_sessions(200, strict=strict, debug=self.debug)
+            candidates = scan_incomplete_sessions(strict=strict, debug=self.debug)
             signature = incomplete_signature(candidates)
 
             self.send_response(200)
@@ -3258,7 +3269,7 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
 
-def start_web_server(port=8080, count=10, debug=False):
+def start_web_server(port=8080, count=0, debug=False):
     """Web UIサーバーを起動"""
     ClaudeResumeHandler.count = count
     ClaudeResumeHandler.debug = debug
@@ -3353,7 +3364,7 @@ def main():
     if args.web is not None:
         port = args.web
         try:
-            start_web_server(port=port, count=10, debug=args.debug)
+            start_web_server(port=port, count=0, debug=args.debug)
         except OSError as e:
             print(f"⚠️  ポート {port} でサーバーを起動できませんでした: {e}")
             print(f"   別のポートを試してください: claude-resume --web <ポート番号>")
