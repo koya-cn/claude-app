@@ -1,2 +1,9 @@
 __pycache__/
 *.py[cod]
+.cross-review/
+
+# タスク秘書: 台帳・設定・実行結果はリポジトリに置かない（ADR 0001 / AC-22）
+.claude-secretary/
+ledger.json
+forbidden-patterns.json
+.pytest_cache/

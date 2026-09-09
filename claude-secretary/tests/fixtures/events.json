@@ -1,0 +1,119 @@
+[
+  {
+    "id": "evt-note-only",
+    "summary": "架空の定例A",
+    "start": {
+      "dateTime": "2026-09-02T10:00:00+09:00"
+    },
+    "end": {
+      "dateTime": "2026-09-02T11:00:00+09:00"
+    },
+    "responseStatus": "accepted",
+    "attachments": [
+      {
+        "title": "架空の定例A - 2026/09/02 メモ",
+        "fileUrl": "https://docs.google.com/document/d/fakedoc-note-a/edit?usp=meet_tnfm_calendar"
+      }
+    ]
+  },
+  {
+    "id": "evt-note-and-manual",
+    "summary": "架空の定例B",
+    "start": {
+      "dateTime": "2026-09-03T14:00:00+09:00"
+    },
+    "end": {
+      "dateTime": "2026-09-03T15:00:00+09:00"
+    },
+    "responseStatus": "declined",
+    "attachments": [
+      {
+        "title": "架空の定例B - 2026/09/03 メモ",
+        "fileUrl": "https://docs.google.com/document/d/fakedoc-note-b/edit?usp=meet_tnfm_calendar"
+      },
+      {
+        "title": "架空の定例B アジェンダ",
+        "fileUrl": "https://docs.google.com/document/d/fakedoc-agenda-b/edit"
+      }
+    ]
+  },
+  {
+    "id": "evt-manual-only",
+    "summary": "架空の打ち合わせC",
+    "start": {
+      "dateTime": "2026-09-04T09:00:00+09:00"
+    },
+    "end": {
+      "dateTime": "2026-09-04T09:30:00+09:00"
+    },
+    "responseStatus": "needsAction",
+    "attachments": [
+      {
+        "title": "架空の打ち合わせC ランシート",
+        "fileUrl": "https://docs.google.com/document/d/fakedoc-runsheet-c/edit"
+      }
+    ]
+  },
+  {
+    "id": "evt-no-attachment",
+    "summary": "架空の予定D",
+    "start": {
+      "dateTime": "2026-09-05T13:00:00+09:00"
+    },
+    "end": {
+      "dateTime": "2026-09-05T13:30:00+09:00"
+    },
+    "responseStatus": "accepted"
+  },
+  {
+    "id": "evt-on-start-boundary",
+    "summary": "架空の予定E",
+    "start": {
+      "dateTime": "2026-09-01T00:00:00+09:00"
+    },
+    "end": {
+      "dateTime": "2026-09-01T01:00:00+09:00"
+    },
+    "responseStatus": "accepted",
+    "attachments": [
+      {
+        "title": "架空の予定E メモ",
+        "fileUrl": "https://docs.google.com/document/d/fakedoc-note-e/edit?usp=meet_tnfm_calendar"
+      }
+    ]
+  },
+  {
+    "id": "evt-on-end-boundary",
+    "summary": "架空の予定F",
+    "start": {
+      "dateTime": "2026-09-08T00:00:00+09:00"
+    },
+    "end": {
+      "dateTime": "2026-09-08T01:00:00+09:00"
+    },
+    "responseStatus": "accepted",
+    "attachments": [
+      {
+        "title": "架空の予定F メモ",
+        "fileUrl": "https://docs.google.com/document/d/fakedoc-note-f/edit?usp=meet_tnfm_calendar"
+      }
+    ]
+  },
+  {
+    "id": "evt-all-day",
+    "summary": "架空の終日予定G",
+    "start": {
+      "date": "2026-09-03"
+    },
+    "end": {
+      "date": "2026-09-04"
+    },
+    "responseStatus": "accepted",
+    "attachments": [
+      {
+        "title": "架空の終日予定G メモ",
+        "fileUrl": "https://docs.google.com/document/d/fakedoc-note-g/edit?usp=meet_tnfm_calendar"
+      }
+    ]
+  }
+]
