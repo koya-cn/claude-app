@@ -6,9 +6,9 @@
 import argparse
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from . import config, ledger
+from . import briefing, config, ledger
 from .events import collect_attachments
 from .ledger import LedgerCorruptError, RecordNotFoundError
 from .notes import parse_next_steps
@@ -46,6 +46,12 @@ def _build_parser():
         "parse-note", help="標準入力の会議メモから投入用のレコード配列を作る"
     )
     noteparser.add_argument("--source-ref", required=True)
+
+    briefer = subcommands.add_parser(
+        "brief", help="台帳からブリーフィングの材料をJSONで出す"
+    )
+    briefer.add_argument("--now", help="基準の時刻（省略時は現在）")
+    briefer.add_argument("--since", help="最近片付けたものを拾う起点（省略時は1日前）")
 
     return parser
 
@@ -95,6 +101,20 @@ def _parse_note(args, stdin):
     ]
 
 
+def _brief(args, path):
+    """台帳を読んで材料を組み立てる。台帳には書き込まない（BR-7）。"""
+    try:
+        now = datetime.fromisoformat(args.now) if args.now else datetime.now().astimezone()
+        since = (
+            datetime.fromisoformat(args.since)
+            if args.since
+            else now - timedelta(days=1)
+        )
+    except ValueError as exc:
+        raise ValidationError(f"時点の指定が読めない: {exc}") from exc
+    return briefing.build(ledger.load(path), now=now, since=since)
+
+
 def main(argv=None, stdin=None, stdout=None, stderr=None):
     """upsert / list / set を振り分ける。"""
     argv = sys.argv[1:] if argv is None else argv
@@ -127,6 +147,9 @@ def main(argv=None, stdin=None, stdout=None, stderr=None):
         elif args.command == "select-events":
             result = _select_events(args, stdin)
             print(json.dumps(result, ensure_ascii=False, indent=2), file=stdout)
+        elif args.command == "brief":
+            material = _brief(args, path)
+            print(json.dumps(material, ensure_ascii=False, indent=2), file=stdout)
         elif args.command == "parse-note":
             records = _parse_note(args, stdin)
             print(json.dumps(records, ensure_ascii=False, indent=2), file=stdout)

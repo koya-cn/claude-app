@@ -209,6 +209,51 @@ class TestParseNote:
         assert not ledger_file.exists()
 
 
+class TestBrief:
+    """台帳からブリーフィングの材料を出す。台帳には書き込まない（BR-6 / BR-7）。"""
+
+    def test_材料をJSONで出す(self, ledger_file, task):
+        run(["upsert"], json.dumps([task()]))
+        code, stdout, _ = run(["brief"])
+        assert code == EXIT_OK
+        material = json.loads(stdout)
+        assert material["ledger"]["counts"]["open"] == 1
+
+    def test_台帳が無ければ空の材料を出す(self, ledger_file):
+        code, stdout, _ = run(["brief"])
+        assert code == EXIT_OK
+        assert json.loads(stdout)["ledger"]["counts"]["open"] == 0
+
+    def test_壊れた台帳では2を返す(self, ledger_file):
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.write_text("{壊れている", encoding="utf-8")
+        code, _, stderr = run(["brief"])
+        assert code == EXIT_VALIDATION
+        assert stderr
+
+    def test_台帳に書き込まない(self, ledger_file, task):
+        run(["upsert"], json.dumps([task()]))
+        before = ledger_file.read_bytes()
+        run(["brief"])
+        assert ledger_file.read_bytes() == before
+
+    def test_時点を指定できる(self, ledger_file, task):
+        run(["upsert"], json.dumps([task()]))
+        record_id = load(ledger_file)[0]["id"]
+        set_fields(ledger_file, record_id, status="done", now="2026-09-09T09:00:00+09:00")
+
+        code, stdout, _ = run(
+            ["brief", "--now", "2026-09-09T12:00:00+09:00",
+             "--since", "2026-09-09T00:00:00+09:00"]
+        )
+        assert code == EXIT_OK
+        assert len(json.loads(stdout)["recently_done"]) == 1
+
+    def test_時点の指定が不正なら2を返す(self, ledger_file):
+        code, _, _ = run(["brief", "--now", "きのう"])
+        assert code == EXIT_VALIDATION
+
+
 class TestSet:
     """人が変更する列だけを書き換える。"""
 

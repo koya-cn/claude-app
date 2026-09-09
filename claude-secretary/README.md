@@ -66,6 +66,42 @@ python3 -m claude_secretary.cli set <id> --note "先に片付けた"
 | `2` | 検証エラー（台帳は不変更） |
 | `3` | 保存失敗（台帳は不変更） |
 
+### ブリーフィングの材料 (`brief`)
+
+台帳から「今やること」の材料を JSON で出す。台帳には書き込まない。
+
+```bash
+python3 -m claude_secretary.cli brief
+python3 -m claude_secretary.cli brief --now 2026-09-09T09:00:00+09:00 --since 2026-09-02T09:00:00+09:00
+```
+
+未完了を担当ごとに分け、最近片付けたもの、台帳の鮮度（最終収集からの経過日数）を返す。
+**整形はしない。**人が読む形にするのはモデルの仕事（[ADR 0008](../docs/permanent/adr/0008-briefing-via-session-start-hook.md)）。
+
+## 🔔 起動時のブリーフィング
+
+Claude Code を起動したときに、台帳の中身を自動で提示させられる。
+`~/.claude/settings.json` の `hooks.SessionStart` に次を足す。
+
+```json
+{
+  "hooks": [
+    {
+      "type": "command",
+      "command": "python3 \"<リポジトリのパス>/claude-secretary/hooks/session-start-briefing.py\"",
+      "timeout": 10
+    }
+  ]
+}
+```
+
+- 同じ日の2回目以降は出ない。日付が変われば出る。週が変われば週次の形になる
+- 提示した記録は `~/.claude-secretary/last-brief.json` に残る。消せばもう一度出る
+- 台帳が無い・壊れている場合も**黙らずに理由を出す**。人が気づけないため
+- 何が起きても**終了コードは 0**。フックの失敗で起動が止まらないようにしている
+- フックからコネクタは呼べないので、**収集は自動では走らない**。台帳が古ければ
+  収集を促すだけ
+
 ## ⚙️ 台帳ファイル (`~/.claude-secretary/ledger.json`)
 
 環境変数 `CLAUDE_SECRETARY_LEDGER` で置き場所を差し替えられる。
@@ -98,3 +134,4 @@ python3 -m pytest claude-secretary/tests -q
 
 - 要件定義: [docs/work/task-secretary/spec.md](../docs/work/task-secretary/spec.md)
 - 決定記録: [docs/permanent/adr/](../docs/permanent/adr/)
+- ブリーフィングの要件定義: [docs/work/task-secretary-briefing/spec.md](../docs/work/task-secretary-briefing/spec.md)
