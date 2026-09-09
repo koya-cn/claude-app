@@ -1,6 +1,6 @@
 # task-secretary
 
-- Status: done
+- Status: done（レビュー所見 #28 の対応を同ブランチで追加）
 - Branch: `feature/task-secretary`
 - Issue: なし（作成時点で関連するオープンIssueなし）
 

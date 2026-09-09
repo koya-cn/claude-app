@@ -45,6 +45,19 @@ def load(path):
         raise LedgerCorruptError(f"台帳のJSONが壊れている: {path}") from exc
     if not isinstance(records, list):
         raise LedgerCorruptError(f"台帳が配列ではない: {path}")
+
+    # 台帳は人が直接編集できる形で保存している。手で足したレコードには id が無く、
+    # そのまま進めると同一性の判定ができない。書き換えずに拒否して人に直させる
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise LedgerCorruptError(
+                f"{index}番目のレコードが辞書ではない: {path}"
+            )
+        if not record.get("id"):
+            raise LedgerCorruptError(
+                f"{index}番目のレコードに id が無い: {path}。"
+                "手で足したレコードには id が必要。upsert 経由で追加すること"
+            )
     return records
 
 

@@ -7,7 +7,7 @@ import pytest
 from claude_secretary.secrets_scan import (
     FINDING_EXTERNAL_EMAIL,
     FINDING_HOME_PATH,
-    FINDING_LEDGER_FILE,
+    FINDING_PRIVATE_FILE,
     FINDING_SERVICE_IDENTIFIER,
     SELF_EXCLUDED_PATHS,
     repo_files,
@@ -76,7 +76,7 @@ class TestScanRepo:
     def test_台帳や設定の実体がリポジトリに無い(self):
         findings = scan_repo(REPO_ROOT)
         offenders = {
-            path for path, kinds in findings.items() if FINDING_LEDGER_FILE in kinds
+            path for path, kinds in findings.items() if FINDING_PRIVATE_FILE in kinds
         }
         assert offenders == set()
 

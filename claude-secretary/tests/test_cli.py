@@ -61,6 +61,24 @@ class TestUpsert:
         assert code == EXIT_SAVE_FAILED
 
 
+class TestBrokenLedger:
+    """壊れた台帳は規約外の終了コードや未捕捉の例外にしない。"""
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["upsert"], ["list"], ["set", "なにか", "--status", "done"]],
+        ids=["upsert", "list", "set"],
+    )
+    def test_idが無いレコードがある台帳では2を返す(self, ledger_file, argv, task):
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.write_text(
+            '[{"title": "手で書いた項目", "status": "open"}]', encoding="utf-8"
+        )
+        code, _, stderr = run(argv, json.dumps([task()]))
+        assert code == EXIT_VALIDATION
+        assert stderr
+
+
 class TestList:
     """台帳の全レコードをJSONで標準出力に書く。"""
 

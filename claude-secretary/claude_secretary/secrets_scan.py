@@ -15,9 +15,10 @@ EXTRA_PATTERNS_FILE = "~/.claude-secretary/forbidden-patterns.json"
 # 架空データにのみ許すメールのドメイン（AC-26）
 ALLOWED_EMAIL_DOMAINS = ("example.com", "example.org", "example.net")
 
-LEDGER_FILE_NAMES = ("ledger.json", "forbidden-patterns.json")
+# 台帳と設定の実体。リポジトリに存在してはいけないファイル名
+PRIVATE_FILE_NAMES = ("ledger.json", "config.json", "forbidden-patterns.json")
 
-FINDING_LEDGER_FILE = "ledger_file"
+FINDING_PRIVATE_FILE = "private_file"
 FINDING_HOME_PATH = "home_path"
 FINDING_EXTERNAL_EMAIL = "external_email"
 FINDING_SERVICE_IDENTIFIER = "service_identifier"
@@ -43,13 +44,18 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}")
 def repo_files(root):
     """走査対象のファイルを返す。.git と gitignore 済みのパスを除く。"""
     root = Path(root)
-    listed = subprocess.run(
-        ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
-        cwd=str(root),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
+    try:
+        listed = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        raise ValueError(
+            f"git の管理下として読めない: {root}。走査は git リポジトリで行う"
+        ) from exc
 
     files = []
     for relative in listed.stdout.splitlines():
@@ -87,8 +93,8 @@ def scan_text(text, path=None):
     """
     findings = set()
 
-    if path is not None and Path(path).name in LEDGER_FILE_NAMES:
-        findings.add(FINDING_LEDGER_FILE)
+    if path is not None and Path(path).name in PRIVATE_FILE_NAMES:
+        findings.add(FINDING_PRIVATE_FILE)
 
     if str(Path.home()) in text:
         findings.add(FINDING_HOME_PATH)

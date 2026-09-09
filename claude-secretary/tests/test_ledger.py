@@ -164,6 +164,49 @@ class TestRobustness:
 
         assert ledger_file.read_bytes() == before
 
+    def test_idが無いレコードは壊れているものとして扱う(self, ledger_file):
+        """台帳は人が直接編集できる形で保存している。手で足すと id が無い。"""
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.write_text(
+            '[{"title": "手で書いた項目", "status": "open"}]', encoding="utf-8"
+        )
+        with pytest.raises(LedgerCorruptError):
+            load(ledger_file)
+
+    def test_idが無いレコードがあっても台帳を書き換えない(self, ledger_file, task):
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.write_text(
+            '[{"title": "手で書いた項目", "status": "open"}]', encoding="utf-8"
+        )
+        before = ledger_file.read_bytes()
+
+        with pytest.raises(LedgerCorruptError):
+            upsert(ledger_file, [task()], now=NOW)
+
+        assert ledger_file.read_bytes() == before
+
+    def test_idが無いレコードがあると状態変更も拒否する(self, ledger_file):
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.write_text(
+            '[{"title": "手で書いた項目", "status": "open"}]', encoding="utf-8"
+        )
+        with pytest.raises(LedgerCorruptError):
+            set_fields(ledger_file, "なにか", status="done")
+
+    def test_レコードが辞書でない台帳も壊れているものとして扱う(self, ledger_file):
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.write_text('["文字列"]', encoding="utf-8")
+        with pytest.raises(LedgerCorruptError):
+            load(ledger_file)
+
+    def test_直し方が分かるメッセージを出す(self, ledger_file):
+        ledger_file.parent.mkdir(parents=True, exist_ok=True)
+        ledger_file.write_text(
+            '[{"title": "手で書いた項目"}]', encoding="utf-8"
+        )
+        with pytest.raises(LedgerCorruptError, match="upsert"):
+            load(ledger_file)
+
     def test_日本語をエスケープせずインデント付きで保存する(self, ledger_file, task):
         upsert(ledger_file, [task()], now=NOW)
         text = ledger_file.read_text(encoding="utf-8")
