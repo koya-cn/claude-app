@@ -3,6 +3,7 @@
 整形はしない。人が読む形にするのはモデルの仕事（ADR 0008）。
 """
 
+import fcntl
 import json
 import os
 from datetime import datetime
@@ -95,6 +96,55 @@ def _parse(stamp):
     except (ValueError, TypeError):
         return None
     return parsed if parsed.tzinfo is not None else None
+
+
+def claim(path, now):
+    """提示の権利を取る。取れたときだけ True を返す（BR-19）。
+
+    セッションは同時に再開されうる。読んでから書くまでの間に他のセッションが
+    割り込むと、全員が「今日はまだ出していない」と判断して全員が提示する。
+    実測（2026-09-11）では3つのセッションが5ミリ秒の間に発火し、3つとも提示した。
+
+    そのため読み取りから書き込みまでを排他ロックで囲み、権利を取れた1つだけが
+    True を受け取るようにする。ロックが使えない環境では従来どおりに振る舞い、
+    提示が重複しうることを受け入れる（提示が止まるよりはましなため）。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(path, "a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            # ロックできない環境では従来どおり。重複は許容する
+            state = load_state(path)
+            show, kind = should_show(state, now)
+            if show:
+                save_state(path, next_state(now))
+            return show, kind
+
+        try:
+            handle.seek(0)
+            raw = handle.read()
+            try:
+                state = json.loads(raw) if raw.strip() else {}
+            except json.JSONDecodeError:
+                state = {}
+            if not isinstance(state, dict):
+                state = {}
+
+            show, kind = should_show(state, now)
+            if show:
+                handle.seek(0)
+                handle.truncate()
+                handle.write(
+                    json.dumps(next_state(now), ensure_ascii=False, indent=2) + "\n"
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+            return show, kind
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def build(records, now, since):

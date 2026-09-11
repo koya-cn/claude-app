@@ -51,24 +51,22 @@ def emit(text):
 
 def run():
     state_file = briefing.state_path()
-    state = briefing.load_state(state_file)
     now = datetime.now().astimezone()
 
-    show, kind = briefing.should_show(state, now)
+    # 提示の権利は排他で取る。セッションが同時に再開されても1つだけが出す
+    show, kind = briefing.claim(state_file, now)
     if not show:
         return
 
     ledger_file = ledger.ledger_path()
     if not Path(ledger_file).exists():
         emit(NO_LEDGER)
-        briefing.save_state(state_file, briefing.next_state(now))
         return
 
     try:
         records = ledger.load(ledger_file)
     except LedgerCorruptError:
         emit(BROKEN_LEDGER.format(path=ledger_file))
-        briefing.save_state(state_file, briefing.next_state(now))
         return
 
     span = 7 if kind == briefing.KIND_WEEKLY else 1
@@ -82,7 +80,6 @@ def run():
     parts.append(json.dumps(material, ensure_ascii=False, indent=2))
 
     emit("\n".join(parts))
-    briefing.save_state(state_file, briefing.next_state(now))
 
 
 def main():

@@ -1,11 +1,13 @@
 """ブリーフィングの材料と提示頻度（BR-1〜BR-13）。"""
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from claude_secretary.briefing import (
     KIND_DAILY,
+    claim,
     KIND_WEEKLY,
     build,
     load_state,
@@ -206,3 +208,62 @@ class TestState:
         save_state(path, next_state(NOW))
         show, _ = should_show(load_state(path), now=NOW)
         assert show is False
+
+
+class TestClaim:
+    """BR-19: 同時に起動しても提示は1つだけ。
+
+    セッションが複数同時に再開されると、読んでから書くまでの間に他が割り込む。
+    実測（2026-09-11）では3つのセッションが5ミリ秒の間に発火し、全部が提示した。
+    """
+
+    def test_取れたときだけTrueを返す(self, tmp_path):
+        path = tmp_path / "state.json"
+        assert claim(path, NOW)[0] is True
+        assert claim(path, NOW)[0] is False
+
+    def test_日付が変われば取れる(self, tmp_path):
+        path = tmp_path / "state.json"
+        claim(path, NOW)
+        assert claim(path, NOW + timedelta(days=1))[0] is True
+
+    def test_初回は週次の形になる(self, tmp_path):
+        assert claim(tmp_path / "state.json", NOW)[1] == KIND_WEEKLY
+
+    def test_同じ週の翌日は日次の形になる(self, tmp_path):
+        path = tmp_path / "state.json"
+        claim(path, NOW)
+        assert claim(path, NOW + timedelta(days=1))[1] == KIND_DAILY
+
+    def test_同時に呼ばれても1つしか取れない(self, tmp_path):
+        """本番で起きたのはこれ。8つ同時に走らせて1つだけが勝つこと。"""
+        import concurrent.futures
+
+        path = tmp_path / "state.json"
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: claim(path, NOW)[0], range(8)))
+        assert results.count(True) == 1, results
+
+    def test_別プロセスから同時に呼ばれても1つしか取れない(self, tmp_path):
+        """セッションごとに別プロセスなので、スレッドだけでは足りない。"""
+        import subprocess
+        import sys
+        import textwrap
+
+        path = tmp_path / "state.json"
+        script = textwrap.dedent(f"""
+            import sys
+            sys.path.insert(0, {str(Path(__file__).resolve().parents[1])!r})
+            from datetime import datetime, timedelta, timezone
+            from claude_secretary.briefing import claim
+            now = datetime(2026, 9, 9, 12, 0, tzinfo=timezone(timedelta(hours=9)))
+            print(claim({str(path)!r}, now)[0])
+        """)
+        procs = [
+            subprocess.Popen(
+                [sys.executable, "-c", script], stdout=subprocess.PIPE, text=True
+            )
+            for _ in range(8)
+        ]
+        outs = [p.communicate()[0].strip() for p in procs]
+        assert outs.count("True") == 1, outs
