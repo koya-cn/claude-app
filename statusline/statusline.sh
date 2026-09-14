@@ -9,6 +9,13 @@ branch=$(echo "$input" | jq -r '.git.branch // empty')
 # 選択中のモデル
 model=$(echo "$input" | jq -r '.model.display_name // empty')
 
+# 上限に当たったときは Vertex へ切り替えて使うため、どちら経由かを見分けられるようにする。
+# statusline の入力 JSON には接続先が含まれないので、Claude Code 自身が参照する環境変数で判定する。
+case "$(printf '%s' "${CLAUDE_CODE_USE_VERTEX:-}" | tr 'A-Z' 'a-z')" in
+  1|true|yes) vertex=1 ;;
+  *) vertex="" ;;
+esac
+
 if [ -z "$cwd" ]; then
   cwd=$(pwd)
 fi
@@ -121,6 +128,13 @@ fi
 if [ -n "$model" ]; then
   [ -n "$out" ] && out="$out | "
   out="${out}${model}"
+fi
+
+# Vertex のときだけバッジを出す（通常の API 経由では何も足さない）
+if [ -n "$vertex" ]; then
+  esc=$(printf '\033')
+  [ -n "$out" ] && out="$out | "
+  out="${out}${esc}[1;33mVertex${esc}[0m"
 fi
 
 five_label=$(render_limit "5h" "$five" "$five_reset")
