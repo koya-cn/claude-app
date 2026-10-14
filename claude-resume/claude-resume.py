@@ -1655,6 +1655,7 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-modal { position: absolute; inset: 0; background: rgba(0,0,0,0.6); backdrop-filter: blur(4px); display: flex; align-items: center; justify-content: center; z-index: 50; animation: ld-fade 0.12s ease-out; }
   @keyframes ld-fade { from {opacity:0} to {opacity:1} }
   .ld-sheet { width: min(860px, 92%); max-height: 88%; background: #0e0e10; border: 1px solid #2a2a30; border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,0.6); display: flex; flex-direction: column; overflow: hidden; }
+  .ld-sheet.maximized { width: calc(100% - 24px); height: calc(100% - 24px); max-height: none; }
   .ld-sheet-head { padding: 14px 18px 12px; border-bottom: 1px solid #1f1f23; background: #131316; }
   .ld-sheet-title { font-size: 17px; font-weight: 500; color: #fff; letter-spacing: -0.01em; line-height: 1.4; margin: 6px 0 8px; }
   .ld-sheet-meta { display: flex; gap: 8px; font-size: 11px; color: #888; font-family: 'JetBrains Mono', monospace; flex-wrap: wrap; overflow: hidden; }
@@ -1781,6 +1782,16 @@ const App = () => {
   const [summaryLoading, setSummaryLoading] = React.useState(false);
   const [summaryStale, setSummaryStale] = React.useState(false);
   const [cachedSummaries, setCachedSummaries] = React.useState({});
+  // 詳細モーダルの最大化（別セッションを開いてもリロードしても引き継ぐ）
+  const MODAL_MAX_KEY = 'claude-resume:modal-maximized';
+  const [modalMaximized, setModalMaximized] = React.useState(() => {
+    try { return localStorage.getItem(MODAL_MAX_KEY) === 'true'; } catch (e) { return false; }
+  });
+  const toggleModalMaximized = () => {
+    const next = !modalMaximized;
+    setModalMaximized(next);
+    try { localStorage.setItem(MODAL_MAX_KEY, String(next)); } catch (e) {}
+  };
 
   // 未完了検出ビュー
   const [view, setView] = React.useState('sessions'); // 'sessions' | 'incomplete'
@@ -2652,7 +2663,7 @@ const App = () => {
 
       {openSession && (
         <div className="ld-modal" onClick={() => setOpenSession(null)}>
-          <div className="ld-sheet" onClick={e => e.stopPropagation()}>
+          <div className={'ld-sheet' + (modalMaximized ? ' maximized' : '')} onClick={e => e.stopPropagation()}>
             <div className="ld-sheet-head">
               <div style={{display:'flex', gap:8, alignItems:'center', marginBottom:6}}>
                 <span className="ld-proj" title={openSession.project}>{openSession.project_name}</span>
@@ -2674,6 +2685,10 @@ const App = () => {
                   <button className="ld-btn herdr"
                           onClick={() => launchHerdr(openSession.project, openSession.session_id)}>
                     Herdrで開く
+                  </button>
+                  <button className="ld-btn" title={modalMaximized ? '元のサイズに戻す' : '最大化'}
+                          onClick={toggleModalMaximized}>
+                    {modalMaximized ? '❐' : '□'}
                   </button>
                   <button className="ld-btn" onClick={() => setOpenSession(null)}>✕</button>
                 </span>
