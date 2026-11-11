@@ -1718,6 +1718,8 @@ HTML_TEMPLATE = """<!doctype html>
   .ld-btn.orange:hover { background: #ea580c; border-color: #ea580c; }
   .ld-btn.herdr { background: #0d7377; border-color: #0d7377; color: #fff; }
   .ld-btn.herdr:hover { background: #14a2a8; border-color: #14a2a8; }
+  .ld-btn.herdr-app { background: #5b21b6; border-color: #5b21b6; color: #fff; }
+  .ld-btn.herdr-app:hover { background: #7c3aed; border-color: #7c3aed; }
   .ld-btn.warn { border-color: #7c5410; color: #fbbf24; }
   .ld-btn.warn:hover { background: #1f1709; border-color: #b8860b; }
   .ld-btn.done { border-color: #1a6a3a; color: #4ade80; }
@@ -2184,6 +2186,7 @@ const App = () => {
                   onClick={() => markIncDone(c)}>✓ 完了にする</button>
           <button className="ld-btn orange" onClick={() => launchTerminal(proj, c.session_id)}>ターミナルで開く</button>
           <button className="ld-btn herdr" onClick={() => launchHerdr(proj, c.session_id)}>Herdrで開く</button>
+          <button className="ld-btn herdr-app" onClick={() => launchHerdrApp(proj, c.session_id)}>Herdr.appで開く</button>
           <div className="ld-cmd-row">
             <span className="ld-cmd-text">{cmd}</span>
             <button className="ld-btn" onClick={() => copyToClipboard(cmd)}>コピー</button>
@@ -2286,6 +2289,18 @@ const App = () => {
         }
       })
       .catch((e) => alert('Herdrで開けませんでした: ' + e));
+  };
+
+  const launchHerdrApp = (project, sessionId) => {
+    const p = new URLSearchParams({ project, session_id: sessionId });
+    fetch('/api/launch-herdr-app?' + p)
+      .then((res) => res.json())
+      .then((data) => {
+        if (!data.ok) {
+          alert('Herdr.appで開けませんでした: ' + (data.error || '不明なエラー'));
+        }
+      })
+      .catch((e) => alert('Herdr.appで開けませんでした: ' + e));
   };
 
   const copyToClipboard = (text) => {
@@ -2610,6 +2625,7 @@ const App = () => {
                         <button className="ld-btn primary" onClick={() => openDetailFromSearch(r)}>全文表示</button>
                         <button className="ld-btn orange" onClick={() => launchTerminal(proj, r.session_id)}>ターミナルで開く</button>
                         <button className="ld-btn herdr" onClick={() => launchHerdr(proj, r.session_id)}>Herdrで開く</button>
+                        <button className="ld-btn herdr-app" onClick={() => launchHerdrApp(proj, r.session_id)}>Herdr.appで開く</button>
                         <div className="ld-cmd-row">
                           <span className="ld-cmd-text">{cmd}</span>
                           <button className="ld-btn" onClick={() => copyToClipboard(cmd)}>コピー</button>
@@ -2685,6 +2701,10 @@ const App = () => {
                   <button className="ld-btn herdr"
                           onClick={() => launchHerdr(openSession.project, openSession.session_id)}>
                     Herdrで開く
+                  </button>
+                  <button className="ld-btn herdr-app"
+                          onClick={() => launchHerdrApp(openSession.project, openSession.session_id)}>
+                    Herdr.appで開く
                   </button>
                   <button className="ld-btn" title={modalMaximized ? '元のサイズに戻す' : '最大化'}
                           onClick={toggleModalMaximized}>
@@ -3048,6 +3068,142 @@ def launch_in_herdr(project, session_id):
     return pane_id
 
 
+# ---- Herdr.app（デスクトップ版 Herdr）----
+# 旧 herdr の Socket API とは別物で、Windows 側の herdr-app.exe CLI で画面を操作する。
+# 方式の決定理由は docs/permanent/adr/0001-herdr-app-open.md。
+
+_HERDR_APP_START_TIMEOUT = 15   # 未起動時に起動してから応答を待つ秒数
+_HERDR_APP_POLL_INTERVAL = 0.5
+_HERDR_APP_CMD_TIMEOUT = 30
+
+
+def _herdr_app_path():
+    """herdr-app.exe の場所を返す。見つからなければ None。
+
+    WSL の PATH には通常入っていないため、Windows 側の既定インストール先も探す。
+    """
+    found = shutil.which('herdr-app') or shutil.which('herdr-app.exe')
+    if found:
+        return found
+    for candidate in sorted(Path('/mnt/c/Users').glob(
+            '*/AppData/Local/Programs/herdr-app/herdr-app.exe')):
+        return str(candidate)
+    return None
+
+
+def _herdr_app_run(exe, args):
+    """herdr-app を同期実行して CompletedProcess を返す。"""
+    return subprocess.run([exe, *args], capture_output=True, text=True,
+                          encoding='utf-8', errors='replace',
+                          timeout=_HERDR_APP_CMD_TIMEOUT)
+
+
+def _herdr_app_cmd(exe, args):
+    """herdr-app を実行し JSON 応答を返す。失敗時は error の内容で RuntimeError。
+
+    herdr-app は失敗時に終了コード 1 と {"error": ...} を返す。
+    """
+    proc = _herdr_app_run(exe, args)
+    try:
+        data = json.loads(proc.stdout) if proc.stdout.strip() else {}
+    except json.JSONDecodeError:
+        data = {}
+    error = data.get('error') if isinstance(data, dict) else None
+    if proc.returncode != 0 or error:
+        detail = error or proc.stderr.strip() or f'終了コード {proc.returncode}'
+        raise RuntimeError(f'Herdr.app {" ".join(args[:2])}: {detail}')
+    return data
+
+
+def _herdr_app_alive(exe):
+    """Herdr.app が応答するか（`herdr-app status` が成功するか）。"""
+    try:
+        return _herdr_app_run(exe, ['status']).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _herdr_app_open_window(exe):
+    """引数なしの herdr-app でウィンドウを開く／前面化する。
+
+    起動済みなら即終了するが、未起動時はアプリ本体になり得るため待たずに切り離す。
+    """
+    subprocess.Popen([exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def _herdr_app_ensure_running(exe):
+    """Herdr.app が未起動なら起動し、応答するまで待つ。"""
+    if _herdr_app_alive(exe):
+        return
+    _herdr_app_open_window(exe)
+    for _ in range(int(_HERDR_APP_START_TIMEOUT / _HERDR_APP_POLL_INTERVAL)):
+        time.sleep(_HERDR_APP_POLL_INTERVAL)
+        if _herdr_app_alive(exe):
+            return
+    raise RuntimeError(
+        f'Herdr.app の起動を待ちましたが応答がありません（{_HERDR_APP_START_TIMEOUT}秒）')
+
+
+def _herdr_app_find_space(spaces, name):
+    """名前が一致する WSL Space の id を返す（先頭優先）。無ければ None。
+
+    Space の folder は作成後に実際の作業フォルダとずれることがあるため照合に使わない。
+    """
+    for space in spaces:
+        if space.get('machine') == 'wsl' and space.get('name') == name:
+            return space.get('id')
+    return None
+
+
+def launch_in_herdr_app(project, session_id):
+    """選択した会話を Herdr.app で `claude --resume` 復元する。
+
+    同名の WSL Space があれば新タブ、無ければ Space を新規作成する。
+    argv で claude を直接起動するのでシェルを介さず、パスのクォートも不要。
+    session_id は呼び出し側で _SESSION_ID_RE 検証済みであること。
+    """
+    exe = _herdr_app_path()
+    if not exe:
+        raise RuntimeError('Herdr.app が見つかりません（herdr-app.exe をインストールしてください）')
+
+    _herdr_app_ensure_running(exe)
+
+    name = os.path.basename(project.rstrip('/')) if project else 'claude-resume'
+    argv = ['claude', '--resume', session_id]
+    tab_name = session_id[:8]
+
+    spaces = _herdr_app_cmd(exe, ['ls']).get('spaces') or []
+    space_id = _herdr_app_find_space(spaces, name)
+    if space_id:
+        command, params = 'tab.new', {'space': space_id, 'name': tab_name}
+    else:
+        command, params = 'space.new', {'name': name, 'tab': tab_name, 'machine': 'wsl'}
+    if project:
+        params['folder'] = project
+    params['argv'] = argv
+    result = _herdr_app_cmd(exe, ['do', command, json.dumps(params)])
+
+    # 作った Space/タブを表示する。space.new 直後に表示が切り替わらないことが
+    # 実測であったため明示的に select する。以降は best-effort で、失敗しても
+    # 会話の起動自体は成功している。
+    for select, target in (('space.select', result.get('space') or space_id),
+                           ('tab.select', result.get('tab'))):
+        if not target:
+            continue
+        try:
+            _herdr_app_cmd(exe, ['do', select, json.dumps({'id': target})])
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            pass
+
+    try:
+        _herdr_app_open_window(exe)
+    except OSError:
+        pass
+
+    return result
+
+
 class ClaudeResumeHandler(BaseHTTPRequestHandler):
     count = 0  # 0 = 全件
     debug = False
@@ -3138,6 +3294,25 @@ class ClaudeResumeHandler(BaseHTTPRequestHandler):
                 try:
                     pane_id = launch_in_herdr(project, session_id)
                     self.wfile.write(json.dumps({"ok": True, "pane_id": pane_id}).encode('utf-8'))
+                except Exception as e:
+                    self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode('utf-8'))
+            else:
+                err = "session_id required" if not session_id else "invalid session_id"
+                self.wfile.write(json.dumps({"ok": False, "error": err}).encode('utf-8'))
+
+        elif parsed.path == '/api/launch-herdr-app':
+            query = parse_qs(parsed.query)
+            project = query.get('project', [''])[0]
+            session_id = query.get('session_id', [''])[0]
+
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json; charset=utf-8')
+            self.end_headers()
+
+            if session_id and _SESSION_ID_RE.match(session_id):
+                try:
+                    launch_in_herdr_app(project, session_id)
+                    self.wfile.write(json.dumps({"ok": True}).encode('utf-8'))
                 except Exception as e:
                     self.wfile.write(json.dumps({"ok": False, "error": str(e)}).encode('utf-8'))
             else:
