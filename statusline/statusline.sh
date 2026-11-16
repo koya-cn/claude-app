@@ -1,6 +1,7 @@
 #!/bin/sh
 input=$(cat)
 now=$(date +%s)
+esc=$(printf '\033')
 
 # プロジェクト名とブランチ
 cwd=$(echo "$input" | jq -r '.cwd // empty')
@@ -97,6 +98,27 @@ format_remaining() {
   fi
 }
 
+# 文字列を SGR コードで色付けし、後続に色が漏れないよう必ずリセットする
+paint() {
+  printf '%s[%sm%s%s[0m' "$esc" "$1" "$2" "$esc"
+}
+
+# 上限が近いことを数字を読まずに気づけるよう、表示上の整数値で 4 段階に色分けする。
+# 色は暗い背景で読みやすいものを選び、数値は太字にして区切りの中から拾いやすくする。
+colorize_pct() {
+  n=$(printf '%.0f' "$1")
+  if [ "$n" -ge 80 ]; then
+    c='31'
+  elif [ "$n" -ge 50 ]; then
+    c='38;5;208'
+  elif [ "$n" -ge 30 ]; then
+    c='33'
+  else
+    c='32'
+  fi
+  paint "1;$c" "${n}%"
+}
+
 # ウィンドウ終了後の使用率は実態を表さないので伏せる
 render_limit() {
   name="$1"
@@ -104,13 +126,13 @@ render_limit() {
   reset_at="$3"
   [ -z "$pct" ] && [ -z "$reset_at" ] && return
   if [ -n "$reset_at" ] && [ "$reset_at" -le "$now" ]; then
-    echo "${name}: --% 期限切れ"
+    echo "${name}: $(paint 90 '--% 期限切れ')"
     return
   fi
   if [ -n "$pct" ]; then
-    label="${name}: $(printf '%.0f' "$pct")%"
+    label="${name}: $(colorize_pct "$pct")"
   else
-    label="${name}: --%"
+    label="${name}: $(paint 90 '--%')"
   fi
   [ -n "$reset_at" ] && label="$label $(format_remaining "$reset_at")"
   echo "$label"
@@ -132,9 +154,8 @@ fi
 
 # Vertex のときだけバッジを出す（通常の API 経由では何も足さない）
 if [ -n "$vertex" ]; then
-  esc=$(printf '\033')
   [ -n "$out" ] && out="$out | "
-  out="${out}${esc}[1;33mVertex${esc}[0m"
+  out="${out}$(paint '1;33' Vertex)"
 fi
 
 five_label=$(render_limit "5h" "$five" "$five_reset")
@@ -151,7 +172,7 @@ fi
 
 if [ -n "$used" ]; then
   [ -n "$out" ] && out="$out | "
-  out="${out}ctx: $(printf '%.0f' "$used")%"
+  out="${out}ctx: $(colorize_pct "$used")"
 fi
 
 echo "$out"
